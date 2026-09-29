@@ -1,6 +1,8 @@
 import { createApp } from 'vue'
-import './style.css'
-import './modern.css'
+import './forest-sand.css'
 import App from './App.vue'
+import PublicClient from './components/PublicClient.vue'
 
-createApp(App).mount('#app')
+const publicMatch = window.location.hash.match(/^#\/(?:service|client)\/([A-Za-z0-9_-]+)$/)
+createApp(publicMatch ? PublicClient : App, publicMatch ? { token: publicMatch[1] } : {}).mount('#app')
+window.addEventListener('hashchange', () => window.location.reload())
