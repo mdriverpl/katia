@@ -1,0 +1,19 @@
+# Secrets
+.env
+**/.env
+*.pem
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Node.js
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# Tooling
+.vscode/
+.DS_Store
