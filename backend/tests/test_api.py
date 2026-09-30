@@ -27,7 +27,7 @@ class ApiTests(unittest.TestCase):
             sock.bind(("127.0.0.1", 0))
             cls.port = sock.getsockname()[1]
         cls.url = f"http://127.0.0.1:{cls.port}/api"
-        cls.environment = {**os.environ, "DATABASE_URL": f"sqlite:///{cls.database.as_posix()}", "APP_SECRET": "isolated-test-secret-not-production"}
+        cls.environment = {**os.environ, "DATABASE_URL": f"sqlite:///{cls.database.as_posix()}", "APP_SECRET": "isolated-test-secret-not-production", "FILE_STORAGE": "database", "WHATSAPP_AUTO_REMINDERS": "false", "WHATSAPP_ACCESS_TOKEN": "", "OPENAI_API_KEY": ""}
         cls.start_server()
         status, result, _ = cls.call("POST", "/auth/login", {"email": "admin@tms.local", "password": "Admin123!"}, auth=False)
         assert status == 200, result
@@ -98,6 +98,46 @@ class ApiTests(unittest.TestCase):
             body += (f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{name}"\r\nContent-Type: application/octet-stream\r\n\r\n').encode() + content + b"\r\n"
         body += f"--{boundary}--\r\n".encode()
         return self.call("POST", f"/documents/{document}/files", body, auth=auth, content_type=f"multipart/form-data; boundary={boundary}")
+
+    def test_daily_summary_auth_and_local_mode(self):
+        self.assertEqual(self.call("POST", "/dashboard/today-summary", auth=False)[0], 403)
+        status, result, headers = self.call("POST", "/dashboard/today-summary")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["source"], "local")
+        self.assertFalse(result["ai_configured"])
+        self.assertIn("today", result["stats"])
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+
+    def test_notification_preferences_persist_and_require_auth(self):
+        for method in ("GET", "PUT"):
+            self.assertEqual(self.call(method, "/notifications/settings", auth=False)[0], 403)
+        data = {"default_method": "smsapi", "automatic": False}
+        self.assertEqual(self.call("PUT", "/notifications/settings", data)[0], 200)
+        result = self.call("GET", "/notifications/settings")[1]
+        self.assertEqual(result["default_method"], "smsapi")
+        self.assertFalse(result["automatic"])
+        self.assertIn("smsapi", result["providers"])
+        self.assertEqual(self.call("PUT", "/notifications/settings", {"default_method": "invalid", "automatic": False})[0], 422)
+        self.assertEqual(self.call("GET", "/notifications/settings")[1]["default_method"], "smsapi")
+        self.assertEqual(self.call("PUT", "/notifications/settings", {"default_method": "whatsapp", "automatic": False})[0], 200)
+
+    def test_whatsapp_settings_subscriptions_and_auth(self):
+        company = self.company()
+        subscription = f"/whatsapp/subscriptions/{company}"
+        for method, path in [("GET", "/whatsapp/settings"), ("PUT", subscription), ("DELETE", subscription), ("POST", f"/whatsapp/services/{uuid4()}/link")]:
+            self.assertEqual(self.call(method, path, auth=False)[0], 403)
+        settings = self.call("GET", "/whatsapp/settings")[1]
+        self.assertFalse(settings["ready"])
+        self.assertFalse(settings["automatic"])
+        self.assertNotIn("access_token", settings)
+        self.assertEqual(self.call("PUT", subscription)[0], 400)
+        self.assertEqual(self.call("PUT", f"/companies/{company}", {"name": "WhatsApp test", "kind": "osoba", "phone": "+48123456789"})[0], 200)
+        self.assertEqual(self.call("PUT", subscription)[0], 200)
+        self.assertEqual(self.call("PUT", subscription)[0], 200)
+        self.assertIn(company, self.call("GET", "/whatsapp/settings")[1]["subscribed_clients"])
+        self.assertEqual(self.call("DELETE", subscription)[0], 200)
+        self.assertNotIn(company, self.call("GET", "/whatsapp/settings")[1]["subscribed_clients"])
+        self.assertEqual(self.call("POST", f"/whatsapp/services/{uuid4()}/link", {"request_id": str(uuid4())})[0], 400)
 
     def test_edit_company_preserves_and_updates_encrypted_pesel(self):
         company = self.company()
@@ -273,6 +313,138 @@ class ApiTests(unittest.TestCase):
         for changes in ({"price": "-1"}, {"price": "1.234"}, {"name": " "}, {"deadline_types": ["Egzamin", "egzamin"]}, {"deadline_types": [""]}):
             self.assertEqual(self.call("POST", "/services", {**data, **changes})[0], 422)
         self.assertEqual(self.call("PUT", f"/services/{uuid4()}", data)[0], 404)
+
+    def test_delete_template_preserves_client_services_and_deadlines(self):
+        _, template, _ = self.call("POST", "/service-types", {"name": "Do usunięcia", "price": "100.00", "deadline_types": ["Egzamin"]})
+        data = {"template_id": template["id"], "company_id": self.company(), "appointments": [{"kind": "Egzamin", "due_date": "2027-01-20"}]}
+        status, service, _ = self.call("POST", "/client-services", data)
+        self.assertEqual(status, 200)
+        path = f"/service-types/{template['id']}"
+        self.assertEqual(self.call("DELETE", path, auth=False)[0], 403)
+        self.assertEqual(self.call("DELETE", path)[0], 200)
+        for listing in ("/service-types", "/services"):
+            self.assertFalse(any(item["id"] == template["id"] for item in self.call("GET", listing)[1]))
+        self.assertEqual(self.call("POST", "/client-services", data)[0], 404)
+        self.assertEqual(self.call("PUT", path, {"name": "Przywróć"})[0], 404)
+        self.assertEqual(self.call("DELETE", path)[0], 404)
+        self.assertEqual(self.call("DELETE", f"/service-types/{uuid4()}")[0], 404)
+        stored = next(item for item in self.call("GET", "/client-services")[1] if item["id"] == service["id"])
+        self.assertEqual(stored, service)
+        deadlines = self.call("GET", "/deadlines")[1]
+        self.assertTrue(any(item.get("client_service_id") == service["id"] for item in deadlines))
+        self.assertEqual(self.call("POST", "/deadlines", {"title": "Nowy", "due_date": "2027-01-21", "service_id": template["id"]})[0], 404)
+
+    def test_document_edit_multiple_terms_and_calendar_visibility(self):
+        document_id, company = self.document("2027-04-01")
+        self.upload(document_id, [("one.txt", b"one"), ("two.txt", b"two")])
+        data = {"company_id": company, "title": "Zmieniony dokument", "number": "123", "status": "gotowy", "terms": [
+            {"description": "Klient", "due_date": "2027-05-01", "calendar": "client"},
+            {"description": "Operator", "due_date": "2027-05-02", "calendar": "operator"},
+            {"description": "Wspólny", "due_date": "2027-05-03", "calendar": "both"},
+        ]}
+        path = f"/documents/{document_id}"
+        self.assertEqual(self.call("PUT", path, data, auth=False)[0], 403)
+        for _ in range(2):
+            self.assertEqual(self.call("PUT", path, data)[0], 200)
+        stored = next(item for item in self.call("GET", "/documents")[1] if item["id"] == document_id)
+        self.assertEqual(stored["terms"], data["terms"])
+        self.assertEqual(stored["status"], "gotowy")
+        self.assertEqual(len(stored["files"]), 2)
+        self.assertIsNone(stored["due_date"])
+        events = [item for item in self.call("GET", "/deadlines")[1] if item.get("document_id") == document_id]
+        self.assertEqual([item["due_date"] for item in events], ["2027-05-02", "2027-05-03"])
+        status, client_terms, _ = self.call("GET", f"/companies/{company}/deadlines")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(client_terms), 3)
+        self.assertTrue(all(item["company_id"] == company for item in client_terms))
+        self.assertEqual(self.call("GET", f"/companies/{company}/deadlines", auth=False)[0], 403)
+        self.assertEqual(self.call("GET", f"/companies/{uuid4()}/deadlines")[0], 404)
+        _, template, _ = self.call("POST", "/service-types", {"name": "Dokumenty test"})
+        _, service, _ = self.call("POST", "/client-services", {"template_id": template["id"], "company_id": company})
+        _, link, _ = self.call("POST", f"/client-services/{service['id']}/public-link")
+        public = self.call("GET", "/public/service", auth=False, extra_headers={"X-Client-Token": link["token"]})[1]
+        self.assertEqual([item["due_date"] for item in public["deadlines"]], ["2027-05-01", "2027-05-03"])
+        self.assertEqual(self.call("PUT", path, {**data, "terms": [{"description": "", "due_date": "2027-05-01", "calendar": "wrong"}]})[0], 422)
+        self.assertEqual(self.call("PUT", path, {**data, "company_id": str(uuid4())})[0], 404)
+        self.assertEqual(self.call("PUT", path, {**data, "terms": []})[0], 200)
+        self.assertFalse(any(item.get("document_id") == document_id for item in self.call("GET", "/deadlines")[1]))
+
+    def test_document_type_edit_and_delete(self):
+        _, kind, _ = self.call("POST", "/document-types", {"name": "Rodzaj do usunięcia"})
+        path = f"/document-types/{kind['id']}"
+        _, doc, _ = self.call("POST", "/documents", {"company_id": self.company(), "title": "Zachowany dokument", "document_type_id": kind["id"]})
+        self.upload(doc["id"], [("plik.txt", b"test")])
+        self.assertEqual(self.call("PUT", path, {"name": "Nowa nazwa"}, auth=False)[0], 403)
+        self.assertEqual(self.call("PUT", path, {"name": "Nowa nazwa"})[0], 200)
+        self.assertEqual(self.call("PUT", path, {"name": "Paszport"})[0], 409)
+        self.assertEqual(self.call("PUT", path, {"name": " "})[0], 422)
+        self.assertEqual(self.call("DELETE", path, auth=False)[0], 403)
+        self.assertEqual(self.call("DELETE", path)[0], 200)
+        self.assertFalse(any(item["id"] == kind["id"] for item in self.call("GET", "/document-types")[1]))
+        stored = next(item for item in self.call("GET", "/documents")[1] if item["id"] == doc["id"])
+        self.assertIsNone(stored["document_type_id"])
+        self.assertEqual(len(stored["files"]), 1)
+        self.assertEqual(self.call("DELETE", path)[0], 404)
+        self.assertEqual(self.call("PUT", path, {"name": "Inna"})[0], 404)
+        self.assertEqual(self.call("POST", "/documents", {"company_id": stored["company_id"], "title": "Test", "document_type_id": kind["id"]})[0], 404)
+
+    def test_service_template_deadline_details(self):
+        data = {"name": "Szablon z adresem", "deadline_types": ["Wizyta"], "deadline_details": [{"kind": "Wizyta", "address": "Testowa 1", "amount": "125.50"}]}
+        status, record, _ = self.call("POST", "/service-types", data)
+        self.assertEqual(status, 200, record)
+        self.assertEqual(record["deadline_details"], data["deadline_details"])
+        path = f"/service-types/{record['id']}"
+        changed = {**data, "deadline_details": [{"kind": "Wizyta", "address": "Inny adres", "amount": "0.00"}]}
+        self.assertEqual(self.call("PUT", path, changed)[0], 200)
+        stored = next(item for item in self.call("GET", "/service-types")[1] if item["id"] == record["id"])
+        self.assertEqual(stored["deadline_details"], changed["deadline_details"])
+        for detail in ({"kind": "Obcy"}, {"kind": "Wizyta", "amount": "-1"}, {"kind": "Wizyta", "amount": "1.234"}):
+            self.assertEqual(self.call("PUT", path, {**data, "deadline_details": [detail]})[0], 422)
+        self.assertEqual(self.call("PUT", path, {**data, "deadline_details": [{"kind": "Wizyta", "address": None, "amount": None}]})[0], 200)
+
+    def test_deadline_type_amount(self):
+        data = {"name": "Termin z kwotą", "amount": "123.45"}
+        status, kind, _ = self.call("POST", "/deadline-types", data)
+        self.assertEqual(status, 200, kind)
+        self.assertEqual(kind["amount"], "123.45")
+        path = f"/deadline-types/{kind['id']}"
+        for amount in ("0.00", "9999999999.99", None):
+            status, updated, _ = self.call("PUT", path, {**data, "amount": amount})
+            self.assertEqual(status, 200)
+            self.assertEqual(updated["amount"], amount)
+            stored = next(item for item in self.call("GET", "/deadline-types")[1] if item["id"] == kind["id"])
+            self.assertEqual(stored["amount"], amount)
+        for amount in ("-1", "1.234", "10000000000", "abc"):
+            self.assertEqual(self.call("PUT", path, {**data, "amount": amount})[0], 422)
+
+    def test_deadline_types_visibility_address_and_rename(self):
+        data = {"name": "Wizyta w urzędzie test", "client_calendar": False, "operator_calendar": True, "address": "Testowa 10, Warszawa"}
+        status, kind, _ = self.call("POST", "/deadline-types", data)
+        self.assertEqual(status, 200, kind)
+        self.assertEqual(self.call("POST", "/deadline-types", {**data, "name": "  WIZYTA  W URZĘDZIE TEST "})[0], 409)
+        self.assertEqual(self.call("POST", "/deadline-types", {"name": " "})[0], 422)
+        self.assertEqual(self.call("GET", "/deadline-types", auth=False)[0], 403)
+        self.assertEqual(self.call("POST", "/deadline-types", data, auth=False)[0], 403)
+        _, template, _ = self.call("POST", "/service-types", {"name": "Widoczność test", "deadline_types": [data["name"]]})
+        _, service, _ = self.call("POST", "/client-services", {"template_id": template["id"], "company_id": self.company(), "appointments": [{"kind": data["name"], "due_date": "2027-02-10"}]})
+        _, link, _ = self.call("POST", f"/client-services/{service['id']}/public-link")
+        headers = {"X-Client-Token": link["token"]}
+        self.assertEqual(self.call("GET", "/public/service", auth=False, extra_headers=headers)[1]["deadlines"], [])
+        events = self.call("GET", "/deadlines")[1]
+        event = next(item for item in events if item.get("client_service_id") == service["id"])
+        self.assertEqual(event["address"], data["address"])
+        updated = {**data, "name": "Nowa nazwa wizyty test", "client_calendar": True, "operator_calendar": False}
+        path = f"/deadline-types/{kind['id']}"
+        self.assertEqual(self.call("PUT", path, updated, auth=False)[0], 403)
+        self.assertEqual(self.call("PUT", path, updated)[0], 200)
+        self.assertFalse(any(item.get("client_service_id") == service["id"] for item in self.call("GET", "/deadlines")[1]))
+        public = self.call("GET", "/public/service", auth=False, extra_headers=headers)[1]["deadlines"]
+        self.assertEqual(len(public), 1)
+        self.assertEqual(public[0]["deadline_types"], [updated["name"]])
+        self.assertEqual(public[0]["address"], data["address"])
+        stored = next(item for item in self.call("GET", "/service-types")[1] if item["id"] == template["id"])
+        self.assertEqual(stored["deadline_types"], [updated["name"]])
+        self.assertEqual(self.call("PUT", f"/deadline-types/{uuid4()}", updated)[0], 404)
 
     def test_service_multiple_deadline_types(self):
         _, service, _ = self.call("POST", "/services", {"name": "Usługa do kalendarza", "deadline_types": ["Badania", "Szkolenie", "Egzamin"]})

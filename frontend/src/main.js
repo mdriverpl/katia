@@ -1,5 +1,7 @@
 import { createApp } from 'vue'
 import './forest-sand.css'
+import './themes.css'
+import './theme.js'
 import App from './App.vue'
 import PublicClient from './components/PublicClient.vue'
 

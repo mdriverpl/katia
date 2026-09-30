@@ -1,6 +1,7 @@
 <script setup>
+import StatusBadge from './StatusBadge.vue'
 import { onMounted, ref } from 'vue'
-import { ShieldCheck } from 'lucide-vue-next'
+import BrandLogo from './BrandLogo.vue'
 import { api } from '../api.js'
 
 const props = defineProps({ token: String })
@@ -20,7 +21,7 @@ async function load() {
   finally { loading.value = false }
 }
 onMounted(() => {
-  document.title = 'TMS · Terminarz klienta'
+  document.title = 'Space & Flow · Terminarz klienta'
   for (const [name, content] of [['robots', 'noindex, nofollow, noarchive'], ['referrer', 'no-referrer']]) {
     const meta = document.createElement('meta'); meta.name = name; meta.content = content; document.head.appendChild(meta)
   }
@@ -29,7 +30,7 @@ onMounted(() => {
 </script>
 <template>
   <main class="public-client-page">
-    <header class="public-client-header"><div class="brand"><ShieldCheck /><span>TMS</span></div><span>Terminarz klienta</span></header>
+    <header class="public-client-header"><BrandLogo /><span>Terminarz klienta</span></header>
     <p v-if="loading" class="empty" role="status">Ładowanie terminów…</p>
     <section v-else-if="error" class="public-section"><h1>Nie można otworzyć terminarza</h1><p class="error" role="alert">{{ error }}</p><button class="primary" @click="load">Spróbuj ponownie</button></section>
     <template v-else-if="data">
@@ -38,8 +39,8 @@ onMounted(() => {
         <h2 id="appointments-title">Wszystkie terminy</h2>
         <ul v-if="data.deadlines.length" class="public-appointments-list">
           <li v-for="event in data.deadlines" :key="event.id" class="agenda-event">
-            <div><strong>{{ event.title }}</strong><small>{{ date(event.due_date) }}<template v-if="event.scheduled_time"> · {{ event.scheduled_time }}</template></small><small>{{ event.document_id ? 'Dokument' : event.client_service_id ? 'Usługa' : 'Termin własny' }}</small><p v-if="event.cost != null">Koszt: {{ money(event.cost) }}</p><p v-if="event.notes" class="service-description">{{ event.notes }}</p></div>
-            <span class="tag">{{ event.status }}</span>
+            <div><strong>{{ event.title }}</strong><small>{{ date(event.due_date) }}<template v-if="event.scheduled_time"> · {{ event.scheduled_time }}</template></small><small>{{ event.document_id ? 'Dokument' : event.client_service_id ? 'Usługa' : 'Termin własny' }}</small><p v-if="event.cost != null">Koszt: {{ money(event.cost) }}</p><p v-if="event.address">Adres: {{ event.address }}</p><p v-if="event.notes" class="service-description">{{ event.notes }}</p></div>
+            <StatusBadge :status="event.status" :due-date="event.due_date" />
           </li>
         </ul>
         <p v-else class="empty">Brak zapisanych terminów.</p>

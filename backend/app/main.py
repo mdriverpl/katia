@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import imaplib
+import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
@@ -10,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from email import message_from_bytes
 from uuid import UUID, uuid4, uuid5
+from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from typing import Literal
 
@@ -24,6 +27,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from sqlalchemy import Date, DateTime, ForeignKey, String, Text, LargeBinary, Numeric, JSON, create_engine, select, text, inspect
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy.exc import IntegrityError
+from botocore.exceptions import BotoCoreError, ClientError
+from .storage import storage_backend, s3_client, upload_bucket
+from . import whatsapp, smsapi, daily_summary
 
 load_dotenv()
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -78,11 +84,38 @@ class ServicePublicLink(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class WhatsAppSubscription(Base):
+    __tablename__ = "whatsapp_subscriptions"
+    company_id: Mapped[UUID] = mapped_column(ForeignKey("companies.id"), primary_key=True)
+
+
+class WhatsAppDelivery(Base):
+    __tablename__ = "whatsapp_deliveries"
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    company_id: Mapped[UUID] = mapped_column(ForeignKey("companies.id"))
+    kind: Mapped[str] = mapped_column(String(20))
+    title: Mapped[str] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    message_id: Mapped[str | None] = mapped_column(String(255))
+    error: Mapped[str | None] = mapped_column(Text)
+    provider: Mapped[str] = mapped_column(String(20), default="whatsapp", server_default="whatsapp")
+
+
+class NotificationSettings(Base):
+    __tablename__ = "notification_settings"
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    default_method: Mapped[str] = mapped_column(String(20), default="whatsapp")
+    automatic: Mapped[bool] = mapped_column(default=False)
+
+
 class DocumentType(Base):
     __tablename__ = "document_types"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     name: Mapped[str] = mapped_column(String(100))
     name_key: Mapped[str] = mapped_column(String(300), unique=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    seed_name: Mapped[str | None] = mapped_column(String(100))
 
 
 class DocumentTypeInput(BaseModel):
@@ -104,7 +137,46 @@ class Document(Base):
     number: Mapped[str | None] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(30), default="nowy")
     due_date: Mapped[date | None] = mapped_column(Date)
+    terms: Mapped[list[dict] | None] = mapped_column(JSON)
     company: Mapped[Company] = relationship(back_populates="documents")
+
+
+class DeadlineType(Base):
+    __tablename__ = "deadline_types"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    name: Mapped[str] = mapped_column(String(100))
+    name_key: Mapped[str] = mapped_column(String(300), unique=True)
+    client_calendar: Mapped[bool] = mapped_column(default=True)
+    operator_calendar: Mapped[bool] = mapped_column(default=True)
+    address: Mapped[str | None] = mapped_column(Text)
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+
+
+class DeadlineTypeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=100)
+    client_calendar: bool = True
+    operator_calendar: bool = True
+    address: str | None = Field(default=None, max_length=2000)
+    amount: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
+
+
+class DeadlineTypeOutput(DeadlineTypeInput):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+
+
+def deadline_type_key(name):
+    return " ".join(name.split()).casefold()
+
+
+def register_deadline_types(db, names):
+    known = {item.name_key for item in db.scalars(select(DeadlineType))}
+    for name in names:
+        key = deadline_type_key(name)
+        if key not in known:
+            db.add(DeadlineType(name=name, name_key=key))
+            known.add(key)
 
 
 class Service(Base):
@@ -114,6 +186,8 @@ class Service(Base):
     price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
     description: Mapped[str | None] = mapped_column(Text)
     deadline_types: Mapped[list[str]] = mapped_column(JSON, default=list)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline_details: Mapped[list[dict]] = mapped_column(JSON, default=list)
 
 
 class ServiceInput(BaseModel):
@@ -135,6 +209,28 @@ class ServiceInput(BaseModel):
 
 
 class ServiceOutput(ServiceInput):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+
+
+class TemplateDeadlineDetail(BaseModel):
+    kind: str = Field(min_length=1, max_length=100)
+    address: str | None = Field(default=None, max_length=2000)
+    amount: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
+
+
+class ServiceTemplateInput(ServiceInput):
+    deadline_details: list[TemplateDeadlineDetail] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode="after")
+    def validate_details(self):
+        kinds = [item.kind for item in self.deadline_details]
+        if len(kinds) != len(set(kinds)) or any(kind not in self.deadline_types for kind in kinds):
+            raise ValueError("Dane terminu muszą odpowiadać rodzajom terminów usługi")
+        return self
+
+
+class ServiceTemplateOutput(ServiceTemplateInput):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
 
@@ -207,6 +303,8 @@ class DocumentFile(Base):
     name: Mapped[str] = mapped_column(String(255))
     content: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
     size: Mapped[int]
+    s3_key: Mapped[str | None] = mapped_column(String(255))
+    s3_bucket: Mapped[str | None] = mapped_column(String(255))
 
 
 class DocumentFileOutput(BaseModel):
@@ -214,6 +312,13 @@ class DocumentFileOutput(BaseModel):
     id: UUID
     name: str
     size: int
+
+
+class DocumentTerm(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    description: str = Field(min_length=1, max_length=500)
+    due_date: date
+    calendar: Literal["client", "operator", "both"] = "both"
 
 
 class DocumentOutput(BaseModel):
@@ -226,6 +331,7 @@ class DocumentOutput(BaseModel):
     status: str
     due_date: date | None
     files: list[DocumentFileOutput] = Field(default_factory=list)
+    terms: list[DocumentTerm] | None = None
 
 
 class EmailMessage(Base):
@@ -298,12 +404,14 @@ class CompanyDetailOutput(CompanyOutput):
 
 
 class DocumentInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
     company_id: UUID
     document_type_id: UUID | None = None
-    title: str
-    number: str | None = None
-    status: str = "nowy"
+    title: str = Field(min_length=1, max_length=255)
+    number: str | None = Field(default=None, max_length=100)
+    status: str = Field(default="nowy", min_length=1, max_length=30)
     due_date: date | None = None
+    terms: list[DocumentTerm] | None = Field(default=None, max_length=50)
 
 
 class DeadlineInput(BaseModel):
@@ -354,6 +462,13 @@ def current_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
+        delivery_columns = {column["name"] for column in inspect(connection).get_columns("whatsapp_deliveries")}
+        if "provider" not in delivery_columns:
+            connection.execute(text("ALTER TABLE whatsapp_deliveries ADD COLUMN provider VARCHAR(20) NOT NULL DEFAULT 'whatsapp'"))
+        file_columns = {column["name"] for column in inspect(connection).get_columns("document_files")}
+        for column in ("s3_key", "s3_bucket"):
+            if column not in file_columns:
+                connection.execute(text(f"ALTER TABLE document_files ADD COLUMN {column} VARCHAR(255)"))
         existing = {column["name"] for column in inspect(connection).get_columns("companies")}
         for column in ("first_name", "last_name", "country", "language", "contact_type"):
             if column not in existing:
@@ -368,6 +483,13 @@ async def lifespan(_: FastAPI):
             if column not in existing:
                 connection.execute(text(f"ALTER TABLE companies ADD COLUMN {column} VARCHAR({length})"))
         document_columns = {column["name"] for column in inspect(connection).get_columns("documents")}
+        type_columns = {column["name"] for column in inspect(connection).get_columns("document_types")}
+        if "deleted_at" not in type_columns:
+            connection.execute(text("ALTER TABLE document_types ADD COLUMN deleted_at TIMESTAMP"))
+        if "seed_name" not in type_columns:
+            connection.execute(text("ALTER TABLE document_types ADD COLUMN seed_name VARCHAR(100)"))
+        if "terms" not in document_columns:
+            connection.execute(text("ALTER TABLE documents ADD COLUMN terms JSON"))
         if "document_type_id" not in document_columns:
             uuid_type = "UUID" if connection.dialect.name == "postgresql" else "CHAR(32)"
             connection.execute(text(f"ALTER TABLE documents ADD COLUMN document_type_id {uuid_type} REFERENCES document_types(id)"))
@@ -377,15 +499,35 @@ async def lifespan(_: FastAPI):
             connection.execute(text(f"ALTER TABLE deadlines ADD COLUMN service_id {uuid_type} REFERENCES services(id)"))
         if "deadline_types" not in deadline_columns:
             connection.execute(text("ALTER TABLE deadlines ADD COLUMN deadline_types JSON"))
+        deadline_type_columns = {column["name"] for column in inspect(connection).get_columns("deadline_types")}
+        if "amount" not in deadline_type_columns:
+            connection.execute(text("ALTER TABLE deadline_types ADD COLUMN amount NUMERIC(12, 2)"))
+        template_columns = {column["name"] for column in inspect(connection).get_columns("services")}
+        if "deadline_details" not in template_columns:
+            connection.execute(text("ALTER TABLE services ADD COLUMN deadline_details JSON NOT NULL DEFAULT '[]'"))
+        if "deleted_at" not in template_columns:
+            connection.execute(text("ALTER TABLE services ADD COLUMN deleted_at TIMESTAMP"))
         service_columns = {column["name"] for column in inspect(connection).get_columns("client_services")}
         if "appointments" not in service_columns:
             connection.execute(text("ALTER TABLE client_services ADD COLUMN appointments JSON NOT NULL DEFAULT '[]'"))
         if "progress" not in service_columns:
             connection.execute(text("ALTER TABLE client_services ADD COLUMN progress INTEGER NOT NULL DEFAULT 0"))
     with SessionLocal() as db:
+        known_types = {item.name_key for item in db.scalars(select(DeadlineType))}
+        for model in (Service, ClientService, Deadline):
+            for item in db.scalars(select(model)):
+                for name in item.deadline_types or []:
+                    key = deadline_type_key(name)
+                    if key not in known_types:
+                        db.add(DeadlineType(name=name, name_key=key))
+                        known_types.add(key)
         for name in ("Paszport", "Karta pobytu", "Umowa najmu", "Prawo jazdy", "PESEL", "Akt urodzenia", "Akt małżeństwa", "Ubezpieczenie", "Meldunek", "Zdjęcie"):
-            if not db.scalar(select(DocumentType).where(DocumentType.name_key == name.casefold())):
-                db.add(DocumentType(name=name, name_key=name.casefold()))
+            seeded = db.scalar(select(DocumentType).where((DocumentType.name_key == name.casefold()) | (DocumentType.seed_name == name)))
+            if seeded:
+                if seeded.seed_name is None:
+                    seeded.seed_name = name
+            else:
+                db.add(DocumentType(name=name, name_key=name.casefold(), seed_name=name))
         kod95_id = UUID("fcf9394e-d124-4ac5-9544-b8a41964a6eb")
         if not db.get(Service, kod95_id) and not db.scalar(select(Service).where(Service.name == "KOD95")):
             db.add(Service(id=kod95_id, name="KOD95", price=None, description=None, deadline_types=[]))
@@ -395,7 +537,13 @@ async def lifespan(_: FastAPI):
         if not db.scalar(select(User).where(User.email == "admin@tms.local")):
             db.add(User(email="admin@tms.local", password_hash=password_hash("Admin123!")))
         db.commit()
-    yield
+    whatsapp_stop = asyncio.Event()
+    whatsapp_task = asyncio.create_task(whatsapp_loop(whatsapp_stop))
+    try:
+        yield
+    finally:
+        whatsapp_stop.set()
+        await whatsapp_task
 
 
 app = FastAPI(title="TMS", lifespan=lifespan)
@@ -474,7 +622,7 @@ def public_service_data(response: Response, service: ClientService = Depends(pub
     company = db.get(Company, service.company_id)
     return {
         "client": {"id": company.id, "name": company.name},
-        "deadlines": get_deadlines(db, service.company_id, include_unscheduled=True),
+        "deadlines": get_deadlines(db, service.company_id, include_unscheduled=True, audience="client"),
     }
 
 
@@ -534,15 +682,67 @@ def update_company(company_id: UUID, data: CompanyInput, _: User = Depends(curre
     return company
 
 
+@app.get("/api/deadline-types", response_model=list[DeadlineTypeOutput])
+def deadline_types(_: User = Depends(current_user), db: Session = Depends(db_session)):
+    return db.scalars(select(DeadlineType).order_by(DeadlineType.name)).all()
+
+
+@app.post("/api/deadline-types", response_model=DeadlineTypeOutput)
+def add_deadline_type(data: DeadlineTypeInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    record = DeadlineType(**data.model_dump(), name_key=deadline_type_key(data.name))
+    db.add(record)
+    return save_deadline_type(db, record)
+
+
+def save_deadline_type(db, record):
+    try:
+        db.commit()
+    except IntegrityError as cause:
+        db.rollback()
+        raise HTTPException(409, "Taki rodzaj terminu już istnieje") from cause
+    db.refresh(record)
+    return record
+
+
+@app.put("/api/deadline-types/{type_id}", response_model=DeadlineTypeOutput)
+def update_deadline_type(type_id: UUID, data: DeadlineTypeInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    record = db.get(DeadlineType, type_id)
+    if not record:
+        raise HTTPException(404, "Nie znaleziono rodzaju terminu")
+    key = deadline_type_key(data.name)
+    if db.scalar(select(DeadlineType).where(DeadlineType.name_key == key, DeadlineType.id != type_id)):
+        raise HTTPException(409, "Taki rodzaj terminu już istnieje")
+    old_key = record.name_key
+    if record.name != data.name:
+        for model in (Service, ClientService, Deadline):
+            for item in db.scalars(select(model)):
+                item.deadline_types = [data.name if deadline_type_key(name) == old_key else name for name in item.deadline_types or []]
+                if isinstance(item, Service):
+                    item.deadline_details = [{**entry, "kind": data.name} if deadline_type_key(entry["kind"]) == old_key else entry for entry in item.deadline_details]
+                if isinstance(item, ClientService):
+                    item.appointments = [{**entry, "kind": data.name} if deadline_type_key(entry["kind"]) == old_key else entry for entry in item.appointments]
+    for field, value in data.model_dump().items():
+        setattr(record, field, value)
+    record.name_key = key
+    return save_deadline_type(db, record)
+
+
 @app.get("/api/document-types", response_model=list[DocumentTypeOutput])
 def document_types(_: User = Depends(current_user), db: Session = Depends(db_session)):
-    return db.scalars(select(DocumentType).order_by(DocumentType.name)).all()
+    return db.scalars(select(DocumentType).where(DocumentType.deleted_at.is_(None)).order_by(DocumentType.name)).all()
 
 
 @app.post("/api/document-types", response_model=DocumentTypeOutput)
 def add_document_type(data: DocumentTypeInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
     name = " ".join(data.name.split())
-    record = DocumentType(name=name, name_key=name.casefold())
+    record = db.scalar(select(DocumentType).where(DocumentType.name_key == name.casefold()))
+    if record and not record.deleted_at:
+        raise HTTPException(409, "Taki rodzaj dokumentu już istnieje")
+    if record:
+        record.name = name
+        record.deleted_at = None
+    else:
+        record = DocumentType(name=name, name_key=name.casefold())
     db.add(record)
     try:
         db.commit()
@@ -551,6 +751,40 @@ def add_document_type(data: DocumentTypeInput, _: User = Depends(current_user), 
         raise HTTPException(409, "Taki rodzaj dokumentu już istnieje") from cause
     db.refresh(record)
     return record
+
+
+@app.put("/api/document-types/{type_id}", response_model=DocumentTypeOutput)
+def update_document_type(type_id: UUID, data: DocumentTypeInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    record = db.get(DocumentType, type_id)
+    if not record or record.deleted_at:
+        raise HTTPException(404, "Nie znaleziono rodzaju dokumentu")
+    name = " ".join(data.name.split())
+    record.name = name
+    record.name_key = name.casefold()
+    try:
+        db.commit()
+    except IntegrityError as cause:
+        db.rollback()
+        raise HTTPException(409, "Taki rodzaj dokumentu już istnieje") from cause
+    db.refresh(record)
+    return record
+
+
+@app.delete("/api/document-types/{type_id}")
+def delete_document_type(type_id: UUID, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    record = db.get(DocumentType, type_id)
+    if not record or record.deleted_at:
+        raise HTTPException(404, "Nie znaleziono rodzaju dokumentu")
+    for document in db.scalars(select(Document).where(Document.document_type_id == type_id)):
+        document.document_type_id = None
+    record.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"deleted": True}
+
+
+def valid_document_type(db, type_id):
+    record = db.get(DocumentType, type_id)
+    return record and not record.deleted_at
 
 
 @app.get("/api/documents", response_model=list[DocumentOutput])
@@ -565,11 +799,37 @@ def documents(_: User = Depends(current_user), db: Session = Depends(db_session)
 def add_document(data: DocumentInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
     if not db.get(Company, data.company_id):
         raise HTTPException(404, "Nie znaleziono klienta")
-    if data.document_type_id and not db.get(DocumentType, data.document_type_id):
+    if data.document_type_id and not valid_document_type(db, data.document_type_id):
         raise HTTPException(404, "Nie znaleziono rodzaju dokumentu")
-    record = Document(**data.model_dump())
+    values = data.model_dump(exclude={"terms"})
+    if data.terms is not None:
+        values["due_date"] = None
+    record = Document(**values, terms=[term.model_dump(mode="json") for term in data.terms] if data.terms is not None else None)
     db.add(record)
     db.flush()
+    if record.due_date:
+        db.add(Deadline(title=record.title, due_date=record.due_date, company_id=record.company_id, document_id=record.id, status="planowany"))
+    db.commit()
+    return {"id": record.id}
+
+
+@app.put("/api/documents/{document_id}")
+def update_document(document_id: UUID, data: DocumentInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    record = db.get(Document, document_id)
+    if not record:
+        raise HTTPException(404, "Nie znaleziono dokumentu")
+    if not db.get(Company, data.company_id):
+        raise HTTPException(404, "Nie znaleziono klienta")
+    if data.document_type_id and not valid_document_type(db, data.document_type_id):
+        raise HTTPException(404, "Nie znaleziono rodzaju dokumentu")
+    for key, value in data.model_dump(exclude={"terms"}).items():
+        setattr(record, key, value)
+    if "terms" in data.model_fields_set:
+        record.terms = [term.model_dump(mode="json") for term in data.terms] if data.terms is not None else None
+    if record.terms is not None:
+        record.due_date = None
+    for event in db.scalars(select(Deadline).where(Deadline.document_id == document_id)):
+        db.delete(event)
     if record.due_date:
         db.add(Deadline(title=record.title, due_date=record.due_date, company_id=record.company_id, document_id=record.id, status="planowany"))
     db.commit()
@@ -588,9 +848,33 @@ def upload_files(document_id: UUID, files: list[UploadFile] = File(...), _: User
         if len(content) > 20 * 1024 * 1024:
             raise HTTPException(413, "Maksymalny rozmiar pliku to 20 MB")
         name = (upload.filename or "plik").replace("\\", "/").split("/")[-1][:255] or "plik"
-        attachments.append(DocumentFile(document_id=document_id, name=name, content=content, size=len(content)))
-    db.add_all(attachments)
-    db.commit()
+        attachments.append(DocumentFile(id=uuid4(), document_id=document_id, name=name, content=content, size=len(content)))
+    uploaded = []
+    client = None
+    try:
+        if storage_backend() == "s3":
+            bucket = upload_bucket()
+            client = s3_client()
+            for attachment in attachments:
+                key = f"documents/{document_id}/{attachment.id}"
+                # Record the attempted key too: a timeout can occur after S3 stores it.
+                uploaded.append((bucket, key))
+                client.put_object(Bucket=bucket, Key=key, Body=attachment.content, ContentType="application/octet-stream")
+                attachment.s3_bucket = bucket
+                attachment.s3_key = key
+                attachment.content = b""
+        db.add_all(attachments)
+        db.commit()
+    except Exception as cause:
+        db.rollback()
+        for bucket, key in uploaded:
+            try:
+                client.delete_object(Bucket=bucket, Key=key)
+            except Exception:
+                logging.getLogger(__name__).error("Nie udało się posprzątać pliku S3: %s", key)
+        if isinstance(cause, (BotoCoreError, ClientError)):
+            raise HTTPException(502, "Nie udało się zapisać plików w S3. Spróbuj ponownie.") from cause
+        raise
     return attachments
 
 
@@ -599,36 +883,62 @@ def download_file(document_id: UUID, file_id: UUID, _: User = Depends(current_us
     attachment = db.get(DocumentFile, file_id)
     if not attachment or attachment.document_id != document_id:
         raise HTTPException(404, "Nie znaleziono pliku")
-    return Response(attachment.content, media_type="application/octet-stream", headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(attachment.name, safe='')}", "X-Content-Type-Options": "nosniff"})
+    if attachment.s3_key:
+        try:
+            result = s3_client().get_object(Bucket=attachment.s3_bucket, Key=attachment.s3_key)
+            try:
+                content = result["Body"].read()
+            finally:
+                result["Body"].close()
+        except (BotoCoreError, ClientError) as cause:
+            raise HTTPException(502, "Nie udało się pobrać pliku z S3. Spróbuj ponownie.") from cause
+    else:
+        content = attachment.content
+    return Response(content, media_type="application/octet-stream", headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(attachment.name, safe='')}", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
 
 
-@app.get("/api/services", response_model=list[ServiceOutput])
-@app.get("/api/service-types", response_model=list[ServiceOutput])
+@app.get("/api/services", response_model=list[ServiceTemplateOutput])
+@app.get("/api/service-types", response_model=list[ServiceTemplateOutput])
 def services(_: User = Depends(current_user), db: Session = Depends(db_session)):
-    return db.scalars(select(Service).order_by(Service.name)).all()
+    return db.scalars(select(Service).where(Service.deleted_at.is_(None)).order_by(Service.name)).all()
 
 
-@app.post("/api/services", response_model=ServiceOutput)
-@app.post("/api/service-types", response_model=ServiceOutput)
-def add_service(data: ServiceInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
-    service = Service(**data.model_dump())
+@app.post("/api/services", response_model=ServiceTemplateOutput)
+@app.post("/api/service-types", response_model=ServiceTemplateOutput)
+def add_service(data: ServiceTemplateInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    register_deadline_types(db, data.deadline_types)
+    service = Service(**data.model_dump(exclude={"deadline_details"}), deadline_details=[item.model_dump(mode="json") for item in data.deadline_details])
     db.add(service)
     db.commit()
     db.refresh(service)
     return service
 
 
-@app.put("/api/services/{service_id}", response_model=ServiceOutput)
-@app.put("/api/service-types/{service_id}", response_model=ServiceOutput)
-def update_service(service_id: UUID, data: ServiceInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+@app.put("/api/services/{service_id}", response_model=ServiceTemplateOutput)
+@app.put("/api/service-types/{service_id}", response_model=ServiceTemplateOutput)
+def update_service(service_id: UUID, data: ServiceTemplateInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
     service = db.get(Service, service_id)
-    if not service:
+    if not service or service.deleted_at:
         raise HTTPException(404, "Nie znaleziono usługi")
-    for key, value in data.model_dump().items():
+    register_deadline_types(db, data.deadline_types)
+    service.deadline_details = [item.model_dump(mode="json") for item in data.deadline_details] if "deadline_details" in data.model_fields_set else [item for item in service.deadline_details if item["kind"] in data.deadline_types]
+    for key, value in data.model_dump(exclude={"deadline_details"}).items():
         setattr(service, key, value)
     db.commit()
     db.refresh(service)
     return service
+
+
+@app.delete("/api/services/{service_id}")
+@app.delete("/api/service-types/{service_id}")
+def delete_service(service_id: UUID, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    service = db.get(Service, service_id)
+    if not service or service.deleted_at:
+        raise HTTPException(404, "Nie znaleziono rodzaju usługi")
+    # Preserve references from existing client services and appointments.
+    service.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"deleted": True}
 
 
 @app.get("/api/client-services", response_model=list[ClientServiceOutput])
@@ -639,7 +949,7 @@ def client_services(_: User = Depends(current_user), db: Session = Depends(db_se
 @app.post("/api/client-services", response_model=ClientServiceOutput)
 def add_client_service(data: ClientServiceInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
     template = db.get(Service, data.template_id)
-    if not template:
+    if not template or template.deleted_at:
         raise HTTPException(404, "Nie znaleziono rodzaju usługi")
     if not db.get(Company, data.company_id):
         raise HTTPException(404, "Nie znaleziono klienta")
@@ -667,6 +977,7 @@ def update_client_service(service_id: UUID, data: ClientServiceUpdate, _: User =
         raise HTTPException(404, "Nie znaleziono klienta")
     appointments = data.appointments if data.appointments is not None else [ServiceAppointment(**item) for item in service.appointments if item["kind"] in data.deadline_types]
     service.appointments = validate_appointments(appointments, data.deadline_types)
+    register_deadline_types(db, data.deadline_types)
     if service.company_id != data.company_id:
         link = db.get(ServicePublicLink, service.id)
         if link:
@@ -685,13 +996,28 @@ def deadlines(_: User = Depends(current_user), db: Session = Depends(db_session)
     return get_deadlines(db)
 
 
-def get_deadlines(db: Session, company_id: UUID | None = None, include_unscheduled: bool = False):
+@app.get("/api/companies/{company_id}/deadlines")
+def company_deadlines(company_id: UUID, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    if not db.get(Company, company_id):
+        raise HTTPException(404, "Nie znaleziono klienta")
+    return get_deadlines(db, company_id, include_unscheduled=True, audience="all")
+
+
+def get_deadlines(db: Session, company_id: UUID | None = None, include_unscheduled: bool = False, audience: str = "operator"):
     deadline_query = select(Deadline)
     service_query = select(ClientService)
     if company_id is not None:
         deadline_query = deadline_query.where(Deadline.company_id == company_id)
         service_query = service_query.where(ClientService.company_id == company_id)
     records = [{column.name: getattr(item, column.name) for column in Deadline.__table__.columns} for item in db.scalars(deadline_query)]
+    document_query = select(Document)
+    if company_id is not None:
+        document_query = document_query.where(Document.company_id == company_id)
+    for document in db.scalars(document_query):
+        for index, term in enumerate(document.terms or []):
+            if audience != "all" and term["calendar"] not in ("both", audience):
+                continue
+            records.append({"id": uuid5(document.id, f"term-{index}"), "title": f'{document.title} — {term["description"]}', "due_date": date.fromisoformat(term["due_date"]), "company_id": document.company_id, "document_id": document.id, "status": "planowany", "notes": term["description"], "deadline_types": []})
     for service in db.scalars(service_query):
         appointments = service.appointments
         if include_unscheduled:
@@ -700,7 +1026,17 @@ def get_deadlines(db: Session, company_id: UUID | None = None, include_unschedul
         for appointment in appointments:
             if appointment.get("due_date") or include_unscheduled:
                 records.append({"id": uuid5(service.id, appointment["kind"]), "title": f'{service.name} — {appointment["kind"]}', "due_date": date.fromisoformat(appointment["due_date"]) if appointment.get("due_date") else None, "scheduled_time": appointment.get("scheduled_time"), "cost": appointment.get("cost"), "status": "wykonany" if appointment.get("completed") else "planowany", "notes": None, "company_id": service.company_id, "document_id": None, "service_id": service.template_id, "client_service_id": service.id, "deadline_types": [appointment["kind"]]})
-    return sorted(records, key=lambda item: (item["due_date"] or date.max, item.get("scheduled_time") or "", item["title"]))
+    settings = {item.name_key: item for item in db.scalars(select(DeadlineType))}
+    visible = []
+    for record in records:
+        kinds = record.get("deadline_types") or []
+        matching = [settings.get(deadline_type_key(name)) for name in kinds]
+        # A shared appointment is shown only if all its kinds permit this audience.
+        if audience != "all" and any(item and not getattr(item, audience + "_calendar") for item in matching):
+            continue
+        record["address"] = " · ".join(dict.fromkeys(item.address for item in matching if item and item.address)) or None
+        visible.append(record)
+    return sorted(visible, key=lambda item: (item["due_date"] or date.max, item.get("scheduled_time") or "", item["title"]))
 
 
 @app.post("/api/deadlines")
@@ -711,7 +1047,7 @@ def add_deadline(data: DeadlineInput, _: User = Depends(current_user), db: Sessi
         raise HTTPException(400, "Terminy dokumentów są dodawane automatycznie")
     if data.service_id:
         service = db.get(Service, data.service_id)
-        if not service:
+        if not service or service.deleted_at:
             raise HTTPException(404, "Nie znaleziono usługi")
         if any(value not in service.deadline_types for value in data.deadline_types):
             raise HTTPException(400, "Wybrany rodzaj terminu nie należy do tej usługi")
@@ -723,6 +1059,194 @@ def add_deadline(data: DeadlineInput, _: User = Depends(current_user), db: Sessi
     db.add(record)
     db.commit()
     return {"id": record.id}
+
+
+@app.post("/api/dashboard/today-summary")
+def today_summary(response: Response, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    response.headers["Cache-Control"] = "no-store"
+    today = datetime.now(ZoneInfo("Europe/Warsaw")).date()
+    events = get_deadlines(db, include_unscheduled=True, audience="operator")
+    closed_documents = {item.id for item in db.scalars(select(Document)) if str(item.status).strip().lower() in daily_summary.CLOSED}
+    events = [event for event in events if event.get("document_id") not in closed_documents]
+    overview = daily_summary.build_overview(events, list(db.scalars(select(ClientService))), today)
+    if overview["ai_configured"]:
+        try:
+            overview["text"] = daily_summary.generate(overview["stats"], overview["date"])
+            overview["source"] = "ai"
+        except ValueError as cause:
+            overview["notice"] = str(cause)
+    return overview
+
+
+def whatsapp_reminder_parameters(company, event):
+    return [company.name, event["title"], event["due_date"].strftime("%d.%m.%Y"),
+            event.get("scheduled_time") or "do ustalenia", event.get("address") or "do ustalenia"]
+
+
+def notification_preferences(db):
+    settings = db.get(NotificationSettings, 1, populate_existing=True)
+    return {"default_method": settings.default_method if settings else "whatsapp",
+            "automatic": settings.automatic if settings else os.getenv("WHATSAPP_AUTO_REMINDERS", "false").lower() == "true"}
+
+
+def provider_configuration(provider):
+    return smsapi.configuration() if provider == "smsapi" else whatsapp.configuration()
+
+
+def whatsapp_deliver(db, key, company, kind, title, parameters, provider="whatsapp"):
+    # Persist a unique claim before contacting Meta, including across API workers.
+    # Pending/unknown claims are not retried: a timeout can mean Meta accepted it.
+    record = WhatsAppDelivery(key=key, company_id=company.id, kind=kind, title=title[:500], status="pending", provider=provider)
+    db.add(record)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return db.get(WhatsAppDelivery, key)
+    try:
+        send = smsapi.send_message if provider == "smsapi" else whatsapp.send_template
+        record.message_id = send(company.phone, kind, parameters)
+        record.status = "accepted"
+    except (whatsapp.WhatsAppError, smsapi.SmsApiError) as cause:
+        record.status = "unconfirmed"
+        record.error = str(cause)
+    db.commit()
+    return record
+
+
+def whatsapp_run_reminders(now=None):
+    now = now or datetime.now(ZoneInfo("Europe/Warsaw"))
+    if now.hour < 9:
+        return
+    tomorrow = now.date() + timedelta(days=1)
+    with SessionLocal() as db:
+        preferences = notification_preferences(db)
+        if not preferences["automatic"] or not provider_configuration(preferences["default_method"])["ready"]:
+            return
+        ids = list(db.scalars(select(WhatsAppSubscription.company_id)))
+        for company_id in ids:
+            company = db.get(Company, company_id)
+            if not company:
+                continue
+            for event in get_deadlines(db, company_id, audience="client"):
+                closed_statuses = ("wykonany", "zakończony", "zakończona", "gotowy", "wydany", "anulowany", "anulowana", "done", "completed", "cancelled", "canceled")
+                if event["due_date"] != tomorrow or str(event.get("status", "")).strip().lower() in closed_statuses:
+                    continue
+                document = db.get(Document, event["document_id"]) if event.get("document_id") else None
+                if document and str(document.status).strip().lower() in closed_statuses:
+                    continue
+                # Recheck subscription so disabling it takes effect within a batch.
+                if not db.get(WhatsAppSubscription, company_id, populate_existing=True):
+                    break
+                key = f'reminder:{company_id}:{event["id"]}:{tomorrow.isoformat()}'
+                if db.get(WhatsAppDelivery, key):
+                    continue
+                preferences = notification_preferences(db)
+                if not preferences["automatic"] or not provider_configuration(preferences["default_method"])["ready"]:
+                    return
+                whatsapp_deliver(db, key, company, "reminder", event["title"], whatsapp_reminder_parameters(company, event), preferences["default_method"])
+
+
+async def whatsapp_loop(stop):
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(whatsapp_run_reminders)
+        except Exception:
+            logging.getLogger(__name__).error("Notification worker failed; check configuration and database connectivity.")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            pass
+
+
+@app.get("/api/notifications/settings")
+@app.get("/api/whatsapp/settings")
+def whatsapp_settings(_: User = Depends(current_user), db: Session = Depends(db_session)):
+    preferences = notification_preferences(db)
+    return {**whatsapp.configuration(), **preferences,
+            "providers": {"whatsapp": whatsapp.configuration(), "smsapi": smsapi.configuration()},
+            "subscribed_clients": list(db.scalars(select(WhatsAppSubscription.company_id))),
+            "history": [{"id": item.key, "company_id": item.company_id, "title": item.title, "status": item.status,
+                         "created_at": item.created_at, "error": item.error, "provider": item.provider} for item in db.scalars(select(WhatsAppDelivery).order_by(WhatsAppDelivery.created_at.desc()).limit(50))]}
+
+
+class NotificationSettingsInput(BaseModel):
+    default_method: Literal["whatsapp", "smsapi"]
+    automatic: bool
+
+
+@app.put("/api/notifications/settings")
+def save_notification_settings(data: NotificationSettingsInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    settings = db.get(NotificationSettings, 1)
+    if not settings:
+        settings = NotificationSettings(id=1)
+        db.add(settings)
+    settings.default_method = data.default_method
+    settings.automatic = data.automatic
+    db.commit()
+    return notification_preferences(db)
+
+
+@app.put("/api/notifications/subscriptions/{company_id}")
+@app.put("/api/whatsapp/subscriptions/{company_id}")
+def whatsapp_subscribe(company_id: UUID, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    company = db.get(Company, company_id)
+    if not company:
+        raise HTTPException(404, "Nie znaleziono klienta")
+    try:
+        whatsapp.normalize_phone(company.phone)
+    except whatsapp.WhatsAppError as cause:
+        raise HTTPException(400, str(cause)) from cause
+    if not db.get(WhatsAppSubscription, company_id):
+        db.add(WhatsAppSubscription(company_id=company_id))
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+    return {"enabled": True}
+
+
+@app.delete("/api/notifications/subscriptions/{company_id}")
+@app.delete("/api/whatsapp/subscriptions/{company_id}")
+def whatsapp_unsubscribe(company_id: UUID, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    item = db.get(WhatsAppSubscription, company_id)
+    if item:
+        db.delete(item)
+        db.commit()
+    return {"enabled": False}
+
+
+class WhatsAppLinkInput(BaseModel):
+    request_id: UUID
+
+
+@app.post("/api/whatsapp/services/{service_id}/link")
+def whatsapp_send_link(service_id: UUID, data: WhatsAppLinkInput, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    return send_notification_link(service_id, data, user, db, "whatsapp")
+
+
+@app.post("/api/notifications/services/{service_id}/link")
+def notification_send_link(service_id: UUID, data: WhatsAppLinkInput, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    return send_notification_link(service_id, data, user, db, notification_preferences(db)["default_method"])
+
+
+def send_notification_link(service_id, data, user, db, provider):
+    if not provider_configuration(provider)["ready"]:
+        raise HTTPException(400, "Najpierw skonfiguruj wybraną metodę wysyłki w backend/.env.")
+    service = db.get(ClientService, service_id)
+    if not service:
+        raise HTTPException(404, "Nie znaleziono usługi")
+    company = db.get(Company, service.company_id)
+    try:
+        whatsapp.normalize_phone(company.phone)
+    except whatsapp.WhatsAppError as cause:
+        raise HTTPException(400, str(cause)) from cause
+    link = get_public_link(service_id, user, db)
+    if not link["token"]:
+        raise HTTPException(400, "Najpierw utwórz aktywny link w Usługi → Link usługi.")
+    url = os.environ["PUBLIC_APP_URL"].rstrip("/") + "/#/service/" + link["token"]
+    record = whatsapp_deliver(db, f"link:{service_id}:{data.request_id}", company, "link", f"Link: {service.name}", [company.name, url], provider)
+    return {"status": record.status, "error": record.error, "provider": record.provider}
 
 
 @app.get("/api/emails")
