@@ -5,7 +5,7 @@ import FilePreview from './FilePreview.vue'
 import FileTypeTile from './FileTypeTile.vue'
 import DeadlineTypeAutocomplete from './DeadlineTypeAutocomplete.vue'
 import { ArrowLeft, Download, FileText, Pencil, Plus, X } from 'lucide-vue-next'
-const props = defineProps({ documents: Array, clients: Array, types: Array, request: Function, clientFilter: String })
+const props = defineProps({ documents: Array, clients: Array, types: Array, request: Function, clientFilter: String, canDelete: Boolean })
 const emit = defineEmits(['saved', 'download', 'cancelled'])
 const preview = ref(null)
 const query = ref('')
@@ -64,12 +64,23 @@ async function save() {
   finally { busy.value = false }
 }
 function close() { visible.value = false; if (savedId.value) emit('saved'); else emit('cancelled') }
+async function remove(item) {
+  if (busy.value || !confirm(`Usunąć dokument „${item.title}” wraz z plikami i terminami? Tej operacji nie można cofnąć.`)) return
+  busy.value = true; error.value = ''
+  try {
+    const result = await props.request(`/documents/${item.id}`, { method: 'DELETE' })
+    if (result.cleanup_warning) error.value = result.cleanup_warning
+    emit('saved')
+  } catch (cause) { error.value = cause.message }
+  finally { busy.value = false }
+}
 defineExpose({ open })
 </script>
 
 <template>
   <FilePreview ref="preview" :request="request" />
   <template v-if="!visible">
+    <p v-if="error" class="error" role="alert">{{ error }}</p>
     <div class="document-filters">
       <label>Szukaj nazwy dokumentu lub klienta<input v-model="query" type="search" placeholder="Wpisz nazwę…" /></label>
       <DeadlineTypeAutocomplete id="document-client-filter" label="Klient" :model-value="clientSearch" :options="clients" :required="false" :maxlength="255" placeholder="Wpisz nazwę klienta…" empty-message="Nie znaleziono klienta." @update:model-value="searchClient" @selected="client = $event.id" />
@@ -86,7 +97,7 @@ defineExpose({ open })
           <td><StatusBadge :status="item.status" /></td>
           <td><template v-if="item.terms?.length"><small v-for="(term, index) in item.terms" :key="index">{{ term.due_date }} · {{ term.description }}</small></template><span v-else>{{ item.due_date || '—' }}</span></td>
           <td><div v-if="item.files.length" class="file-type-tiles"><FileTypeTile v-for="file in item.files" :key="file.id" :file="file" @preview="preview.open(item.id, file)" /></div><span v-else>—</span></td>
-          <td><button class="text-button" @click="open(item)"><Pencil :size="14" />Edytuj</button><button class="text-button" @click="open(item)"><Plus :size="14" />Dodaj pliki</button></td>
+          <td><button class="text-button" @click="open(item)"><Pencil :size="14" />Edytuj</button><button class="text-button" @click="open(item)"><Plus :size="14" />Dodaj pliki</button><button v-if="canDelete" class="text-button" :disabled="busy" @click="remove(item)">Usuń</button></td>
         </tr></tbody>
       </table><p v-else class="empty">Brak dokumentów pasujących do filtrów.</p>
     </section>

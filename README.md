@@ -1,5 +1,94 @@
 # TMS
 
+## Formularz klienta
+
+Formularz wymaga imienia i nazwiska. Nazwa klienta jest składana automatycznie
+z tych pól, a typ przy zapisie zawsze wynosi `osoba`. Starsze rekordy pozostają
+czytelne; przy ich edycji sprawdź imię i nazwisko podpowiedziane z dawnej nazwy.
+
+Administrator może usunąć klienta przyciskiem **Usuń** na liście lub **Usuń
+klienta** w jego karcie. Po potwierdzeniu usuwane są również dokumenty, pliki,
+przypisane usługi, terminy, publiczne linki i powiadomienia klienta. Szablony
+usług i dane innych klientów pozostają. Błąd sprzątania plików w S3 jest
+sygnalizowany w panelu; szczegóły obiektów do usunięcia znajdują się w logach.
+
+## Kalendarz Google
+
+W **Ustawienia → Kalendarz Google** administrator może połączyć jedno konto
+Google ze wspólnym terminarzem aplikacji. Integracja tworzy osobny kalendarz
+**Space & Flow**. Eksport jest jednokierunkowy: własne terminy oraz terminy
+dokumentów i usług widoczne w Terminarzu trafiają do Google. Dane zmieniaj
+w aplikacji; zmiany wydarzeń w Google są nadpisywane przy synchronizacji.
+Wpisy bez daty oraz terminy widoczne wyłącznie w kalendarzu klienta nie są
+eksportowane. Inne wydarzenia, dodane ręcznie do Google, nie są modyfikowane.
+
+Konfiguracja:
+
+1. W Google Cloud utwórz projekt, włącz **Google Calendar API** i skonfiguruj
+   ekran zgody OAuth. Dla aplikacji w trybie testowym dodaj swoje konto do
+   użytkowników testowych.
+2. Utwórz klienta OAuth typu **Web application**. Do dozwolonych adresów
+   przekierowania dodaj dokładny adres z formularza ustawień:
+   `https://TWOJA-DOMENA/api/integrations/google-calendar/callback`.
+3. W aplikacji zapisz Client ID, Client Secret i adres panelu, następnie wybierz
+   **Połącz z Google** i zaakceptuj dostęp. Po powrocie wybierz **Synchronizuj
+   teraz** lub poczekaj na automatyczną synchronizację co 5 minut.
+
+Backend i frontend powinny działać pod jednym adresem z przekazywaniem `/api`
+do backendu, jak w dostarczonej konfiguracji Nginx. W produkcji wymagany jest
+HTTPS; lokalnie dozwolone jest HTTP dla `localhost` i `127.0.0.1`.
+Google Cloud musi mieć dokładnie ten sam adres przekierowania, również port.
+Uprawnienie `calendar.app.created` ogranicza dostęp do kalendarzy utworzonych
+przez aplikację. Client Secret i token odświeżania są szyfrowane za pomocą
+`APP_SECRET`; nie zmieniaj tego sekretu bez migracji zaszyfrowanych danych.
+
+Eksport obejmuje tytuł, imię i nazwisko klienta, datę, godzinę, status i adres
+terminu. Nie przesyła PESEL-u, paszportu, plików ani notatek. Terminy bez godziny
+lub z godziną w formie opisu są całodniowe; konkretna godzina `HH:MM` oznacza
+wydarzenie godzinne w strefie `Europe/Warsaw`. Usunięcie lub ukrycie terminu
+w aplikacji usuwa jego wyeksportowane wydarzenie przy następnej synchronizacji.
+Ponawianie eksportu po błędzie nie tworzy duplikatów. Panel pokazuje ostatnią
+udaną synchronizację i błędy połączenia.
+
+**Rozłącz** zatrzymuje synchronizację i usuwa lokalny token; próbuje również
+cofnąć dostęp w Google. Istniejący kalendarz i wydarzenia pozostają w Google.
+Ponowne połączenie po rozłączeniu tworzy nowy kalendarz. **Ponownie autoryzuj
+Google** zachowuje dotychczasowy kalendarz, jeśli wybrane konto nadal ma do
+niego dostęp.
+
+Weryfikacja automatyczna używa atrap Google — rzeczywiste połączenie i eksport
+sprawdź po konfiguracji własnego projektu OAuth. Dokumentacja Google:
+[OAuth dla aplikacji WWW](https://developers.google.com/identity/protocols/oauth2/web-server),
+[zakresy dostępu Calendar API](https://developers.google.com/workspace/calendar/api/auth).
+
+## Użytkownicy i uprawnienia
+
+Administrator zarządza kontami w **Ustawienia → Użytkownicy**: dodaje konta,
+zmienia rolę Admin/Pracownik, blokuje, odblokowuje i usuwa użytkowników.
+Nie można zablokować, usunąć ani zmienić roli własnego konta.
+Pracownik obsługuje klientów, dokumenty i terminy; ustawienia oraz usuwanie
+dokumentów są dostępne tylko administratorowi, również przez API.
+Listy rodzajów dokumentów, terminów i usług pozostają dostępne do odczytu
+pracownikom, ponieważ są potrzebne do formularzy.
+
+Przed dodaniem kont skonfiguruj **Ustawienia → Poczta SMTP**: host, port,
+STARTTLS (zwykle 587) lub TLS (zwykle 465), login, hasło, nadawcę oraz adres
+HTTPS panelu. Hasło SMTP jest szyfrowane kluczem wynikającym z `APP_SECRET`;
+zachowaj ten sekret przy ponownym wdrożeniu. Formularz nie ujawnia zapisanego
+hasła; puste pole zachowuje dotychczasową wartość. Błąd SMTP wycofuje dodanie
+konta. Przyjęcie wiadomości przez SMTP nie gwarantuje dostarczenia do skrzynki.
+
+Nowy użytkownik otrzymuje e-mailem losowe hasło tymczasowe i musi zmienić je
+przy pierwszym logowaniu. Każdy użytkownik może zmienić hasło w **Moje konto**,
+podając obecne hasło. Zmiana hasła, roli i blokada unieważniają wcześniejsze sesje.
+
+Przy pierwszym uruchomieniu nowej bazy powstaje konto `admin@tms.local`
+z hasłem `Admin123!` — zmień je przed udostępnieniem aplikacji.
+Migracja istniejącej bazy nadaje temu kontu rolę Admin, pozostałym rolę Pracownik.
+Usunięte konto startowe nie jest ponownie tworzone, jeśli istnieją inne konta.
+Usunięcie dokumentu usuwa też jego terminy i załączniki. Jeśli sprzątanie S3
+zawiedzie, panel pokazuje ostrzeżenie, a log serwera wskazuje obiekty do usunięcia.
+
 Panel TMS dla firm, dokumentów, terminów oraz skrzynki e-mail.
 
 ## Uruchomienie

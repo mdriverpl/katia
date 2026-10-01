@@ -715,5 +715,63 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(len([item for item in types if item["name"] == "Paszport"]), 1)
 
 
+    def test_user_roles_blocking_password_and_document_deletion(self):
+        user_id = uuid4()
+        address = f"worker-{user_id.hex}@example.com"
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            stored = connection.execute("SELECT password_hash FROM users WHERE email = 'admin@tms.local'").fetchone()[0]
+            connection.execute("INSERT INTO users (id, email, password_hash, role, blocked, must_change_password, token_version) VALUES (?, ?, ?, 'employee', 0, 1, 0)", (user_id.hex, address, stored))
+        status, session, _ = self.call("POST", "/auth/login", {"email": address, "password": "Admin123!"}, auth=False)
+        self.assertEqual(status, 200)
+        headers = {"Authorization": "Bearer " + session["access_token"]}
+        self.assertTrue(self.call("GET", "/auth/me", auth=False, extra_headers=headers)[1]["must_change_password"])
+        self.assertEqual(self.call("GET", "/companies", auth=False, extra_headers=headers)[0], 403)
+        self.assertEqual(self.call("POST", "/auth/password", {"current_password": "wrong", "new_password": "new-password-123"}, auth=False, extra_headers=headers)[0], 400)
+        self.assertEqual(self.call("POST", "/auth/password", {"current_password": "Admin123!", "new_password": "new-password-123"}, auth=False, extra_headers=headers)[0], 200)
+        self.assertEqual(self.call("GET", "/auth/me", auth=False, extra_headers=headers)[0], 401)
+        session = self.call("POST", "/auth/login", {"email": address, "password": "new-password-123"}, auth=False)[1]
+        headers = {"Authorization": "Bearer " + session["access_token"]}
+        self.assertEqual(self.call("GET", "/companies", auth=False, extra_headers=headers)[0], 200)
+        for route in ("/users", "/settings/mail", "/notifications/settings", "/whatsapp/settings", "/integrations/google-calendar"):
+            self.assertEqual(self.call("GET", route, auth=False, extra_headers=headers)[0], 403, route)
+        for route in ("/integrations/google-calendar/sync", "/integrations/google-calendar/connect"):
+            self.assertEqual(self.call("POST", route, auth=False, extra_headers=headers)[0], 403, route)
+        for route, body in (("/document-types", {"name": "Forbidden"}), ("/deadline-types", {"name": "Forbidden"}),
+                            ("/service-types", {"name": "Forbidden"}), ("/users", {"email": "forbidden@example.com"})):
+            self.assertEqual(self.call("POST", route, body, auth=False, extra_headers=headers)[0], 403, route)
+        company = self.call("POST", "/companies", {"kind": "osoba", "name": "Role test"}, auth=False, extra_headers=headers)[1]["id"]
+        self.assertEqual(self.call("DELETE", f"/companies/{company}", auth=False, extra_headers=headers)[0], 403)
+        document = self.call("POST", "/documents", {"company_id": company, "title": "Role document", "due_date": "2026-12-01"}, auth=False, extra_headers=headers)[1]["id"]
+        self.assertEqual(self.call("DELETE", f"/documents/{document}", auth=False, extra_headers=headers)[0], 403)
+        self.assertEqual(self.call("DELETE", f"/documents/{document}")[0], 200)
+        self.assertFalse(any(item["id"] == document for item in self.call("GET", "/documents")[1]))
+        self.assertFalse(any(item["document_id"] == document for item in self.call("GET", "/deadlines")[1]))
+        self.assertEqual(self.call("DELETE", f"/companies/{company}")[0], 200)
+        self.assertEqual(self.call("GET", f"/companies/{company}")[0], 404)
+        self.assertEqual(self.call("PUT", f"/users/{user_id}", {"role": "employee", "blocked": True})[0], 200)
+        self.assertEqual(self.call("GET", "/companies", auth=False, extra_headers=headers)[0], 401)
+        self.assertEqual(self.call("POST", "/auth/login", {"email": address, "password": "new-password-123"}, auth=False)[0], 401)
+        self.assertEqual(self.call("PUT", f"/users/{user_id}", {"role": "admin", "blocked": False})[0], 200)
+        self.assertEqual(self.call("GET", "/auth/me", auth=False, extra_headers=headers)[0], 401)
+        session = self.call("POST", "/auth/login", {"email": address, "password": "new-password-123"}, auth=False)[1]
+        headers = {"Authorization": "Bearer " + session["access_token"]}
+        self.assertEqual(self.call("GET", "/users", auth=False, extra_headers=headers)[0], 200)
+        self.assertEqual(self.call("DELETE", f"/users/{user_id}", auth=False, extra_headers=headers)[0], 400)
+        self.assertEqual(self.call("DELETE", f"/users/{user_id}")[0], 200)
+        self.assertEqual(self.call("GET", "/auth/me", auth=False, extra_headers=headers)[0], 401)
+
+
+    def test_client_full_name_is_derived_and_type_is_always_person(self):
+        status, result, _ = self.call("POST", "/companies", {"first_name": " Anna ", "last_name": " Nowak-Kowalska ", "kind": "firma", "name": "Ignore this"})
+        self.assertEqual(status, 200)
+        client_id = result["id"]
+        detail = self.call("GET", f"/companies/{client_id}")[1]
+        self.assertEqual(detail["name"], "Anna Nowak-Kowalska")
+        self.assertEqual(detail["kind"], "osoba")
+        self.assertEqual(self.call("PUT", f"/companies/{client_id}", {"first_name": "Anna Maria", "last_name": "Nowak"})[0], 200)
+        self.assertEqual(self.call("GET", f"/companies/{client_id}")[1]["name"], "Anna Maria Nowak")
+        self.assertEqual(self.call("POST", "/companies", {"first_name": " ", "last_name": " "})[0], 422)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,30 +6,32 @@ import hashlib
 import imaplib
 import logging
 import os
+import re
 import secrets
-from contextlib import asynccontextmanager
+import threading
+from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from email import message_from_bytes
 from uuid import UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from typing import Literal
 
 import jwt
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Header
-from fastapi.responses import Response
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Header, Request
+from fastapi.responses import Response, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import Date, DateTime, ForeignKey, String, Text, LargeBinary, Numeric, JSON, create_engine, select, text, inspect
+from sqlalchemy import Date, DateTime, ForeignKey, String, Text, LargeBinary, Numeric, JSON, create_engine, select, delete, text, inspect
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy.exc import IntegrityError
 from botocore.exceptions import BotoCoreError, ClientError
 from .storage import storage_backend, s3_client, upload_bucket
-from . import whatsapp, smsapi, daily_summary
+from . import whatsapp, smsapi, daily_summary, account_mail, google_calendar
 
 load_dotenv()
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -49,6 +51,45 @@ class User(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     email: Mapped[str] = mapped_column(String(255), unique=True)
     password_hash: Mapped[str] = mapped_column(String(256))
+    role: Mapped[str] = mapped_column(String(20), default="employee", server_default="employee")
+    blocked: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
+    must_change_password: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
+    token_version: Mapped[int] = mapped_column(default=0, server_default="0")
+
+
+class MailSettings(Base):
+    __tablename__ = "mail_settings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    host: Mapped[str] = mapped_column(String(255))
+    port: Mapped[int] = mapped_column()
+    security: Mapped[str] = mapped_column(String(20))
+    username: Mapped[str] = mapped_column(String(255))
+    password_encrypted: Mapped[str | None] = mapped_column(Text)
+    sender: Mapped[str] = mapped_column(String(255))
+    public_url: Mapped[str] = mapped_column(String(2048))
+
+
+class GoogleCalendarSettings(Base):
+    __tablename__ = "google_calendar_settings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    client_id: Mapped[str] = mapped_column(String(255))
+    client_secret_encrypted: Mapped[str] = mapped_column(Text)
+    public_url: Mapped[str] = mapped_column(String(2048))
+    refresh_token_encrypted: Mapped[str | None] = mapped_column(Text)
+    calendar_id: Mapped[str | None] = mapped_column(String(1024))
+    namespace: Mapped[str] = mapped_column(String(32), default=lambda: uuid4().hex)
+    automatic: Mapped[bool] = mapped_column(default=False)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class GoogleCalendarOAuthState(Base):
+    __tablename__ = "google_calendar_oauth_states"
+    state_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[UUID] = mapped_column()
+    token_version: Mapped[int] = mapped_column()
+    verifier_encrypted: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class Company(Base):
@@ -350,13 +391,14 @@ class LoginInput(BaseModel):
 
 
 class CompanyInput(BaseModel):
-    kind: str
-    name: str
+    model_config = ConfigDict(str_strip_whitespace=True)
+    kind: str = "osoba"
+    name: str = Field(default="", max_length=255)
     nip: str | None = None
     regon: str | None = None
     pesel: str | None = None
-    first_name: str | None = None
-    last_name: str | None = None
+    first_name: str | None = Field(default=None, max_length=100)
+    last_name: str | None = Field(default=None, max_length=100)
     email: str | None = None
     phone: str | None = None
     country: str | None = None
@@ -368,6 +410,15 @@ class CompanyInput(BaseModel):
     employer_name: str | None = Field(default=None, max_length=255)
     employer_email: str | None = Field(default=None, max_length=255)
     employer_phone: str | None = Field(default=None, max_length=50)
+
+    @model_validator(mode="after")
+    def person_name(self):
+        self.kind = "osoba"
+        if self.first_name and self.last_name:
+            self.name = f"{self.first_name} {self.last_name}"
+        elif not self.name:
+            raise ValueError("Podaj imię i nazwisko klienta")
+        return self
 
     @field_validator("birth_date")
     @classmethod
@@ -439,7 +490,7 @@ def password_hash(password: str) -> str:
 
 def password_matches(password: str, stored: str) -> bool:
     raw = base64.b64decode(stored)
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), raw[:16], 600000) == raw[16:]
+    return secrets.compare_digest(hashlib.pbkdf2_hmac("sha256", password.encode(), raw[:16], 600000), raw[16:])
 
 
 def db_session():
@@ -447,14 +498,27 @@ def db_session():
         yield db
 
 
-def current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(db_session)) -> User:
+def authenticated_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(db_session)) -> User:
     try:
-        user_id = UUID(jwt.decode(credentials.credentials, APP_SECRET, algorithms=["HS256"])["sub"])
+        claims = jwt.decode(credentials.credentials, APP_SECRET, algorithms=["HS256"])
+        user_id = UUID(claims["sub"])
     except (jwt.PyJWTError, KeyError, ValueError) as error:
         raise HTTPException(401, "Nieprawidłowy token") from error
     user = db.get(User, user_id)
-    if not user:
+    if not user or user.blocked or claims.get("version", 0) != user.token_version:
         raise HTTPException(401, "Nieprawidłowy token")
+    return user
+
+
+def current_user(user: User = Depends(authenticated_user)) -> User:
+    if user.must_change_password:
+        raise HTTPException(403, "Zmień hasło tymczasowe przed rozpoczęciem pracy")
+    return user
+
+
+def admin_user(user: User = Depends(current_user)) -> User:
+    if user.role != "admin":
+        raise HTTPException(403, "Ta operacja wymaga uprawnień administratora")
     return user
 
 
@@ -462,6 +526,17 @@ def current_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
+        user_columns = {column["name"] for column in inspect(connection).get_columns("users")}
+        for name, definition in {
+            "role": "VARCHAR(20) NOT NULL DEFAULT 'employee'",
+            "blocked": "BOOLEAN NOT NULL DEFAULT false",
+            "must_change_password": "BOOLEAN NOT NULL DEFAULT false",
+            "token_version": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            if name not in user_columns:
+                connection.execute(text(f"ALTER TABLE users ADD COLUMN {name} {definition}"))
+        if "role" not in user_columns:
+            connection.execute(text("UPDATE users SET role = 'admin' WHERE email = 'admin@tms.local'"))
         delivery_columns = {column["name"] for column in inspect(connection).get_columns("whatsapp_deliveries")}
         if "provider" not in delivery_columns:
             connection.execute(text("ALTER TABLE whatsapp_deliveries ADD COLUMN provider VARCHAR(20) NOT NULL DEFAULT 'whatsapp'"))
@@ -534,16 +609,18 @@ async def lifespan(_: FastAPI):
         # Include existing dated documents once, including records created before this feature.
         for document in db.scalars(select(Document).where(Document.due_date.is_not(None), ~select(Deadline.id).where(Deadline.document_id == Document.id).exists())):
             db.add(Deadline(title=document.title, due_date=document.due_date, company_id=document.company_id, document_id=document.id, status="planowany"))
-        if not db.scalar(select(User).where(User.email == "admin@tms.local")):
-            db.add(User(email="admin@tms.local", password_hash=password_hash("Admin123!")))
+        if not db.scalar(select(User.id).limit(1)):
+            db.add(User(email="admin@tms.local", password_hash=password_hash("Admin123!"), role="admin"))
         db.commit()
     whatsapp_stop = asyncio.Event()
     whatsapp_task = asyncio.create_task(whatsapp_loop(whatsapp_stop))
+    google_task = asyncio.create_task(google_calendar_loop(whatsapp_stop))
     try:
         yield
     finally:
         whatsapp_stop.set()
         await whatsapp_task
+        await google_task
 
 
 app = FastAPI(title="TMS", lifespan=lifespan)
@@ -553,7 +630,7 @@ app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http
 @app.middleware("http")
 async def public_privacy_headers(request, call_next):
     response = await call_next(request)
-    if request.url.path.startswith("/api/public/") or request.url.path.endswith("/public-link"):
+    if request.url.path.startswith(("/api/public/", "/api/integrations/google-calendar")) or request.url.path.endswith("/public-link"):
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
@@ -633,11 +710,383 @@ def health():
 
 @app.post("/api/auth/login")
 def login(data: LoginInput, db: Session = Depends(db_session)):
-    user = db.scalar(select(User).where(User.email == data.email))
-    if not user or not password_matches(data.password, user.password_hash):
+    user = db.scalar(select(User).where(User.email == data.email.strip().lower()))
+    if not user or user.blocked or not password_matches(data.password, user.password_hash):
         raise HTTPException(401, "Nieprawidłowy e-mail lub hasło")
-    token = jwt.encode({"sub": str(user.id), "exp": datetime.now(timezone.utc) + timedelta(hours=8)}, APP_SECRET, algorithm="HS256")
+    token = jwt.encode({"sub": str(user.id), "version": user.token_version, "exp": datetime.now(timezone.utc) + timedelta(hours=8)}, APP_SECRET, algorithm="HS256")
     return {"access_token": token}
+
+
+class UserOutput(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    email: str
+    role: Literal["admin", "employee"]
+    blocked: bool
+    must_change_password: bool
+
+
+class UserInput(BaseModel):
+    email: str = Field(max_length=255)
+    role: Literal["admin", "employee"] = "employee"
+
+    @field_validator("email")
+    @classmethod
+    def valid_email(cls, value):
+        value = value.strip().lower()
+        if not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}", value):
+            raise ValueError("Podaj poprawny adres e-mail")
+        return value
+
+
+class UserUpdate(BaseModel):
+    role: Literal["admin", "employee"]
+    blocked: bool
+
+
+class PasswordInput(BaseModel):
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=12, max_length=128)
+
+
+@app.get("/api/auth/me", response_model=UserOutput)
+def me(user: User = Depends(authenticated_user)):
+    return user
+
+
+@app.post("/api/auth/password")
+def change_password(data: PasswordInput, user: User = Depends(authenticated_user), db: Session = Depends(db_session)):
+    # Serialize password changes so an old password cannot win a concurrent update.
+    user = db.scalar(select(User).where(User.id == user.id).with_for_update().execution_options(populate_existing=True))
+    if not password_matches(data.current_password, user.password_hash):
+        raise HTTPException(400, "Obecne hasło jest nieprawidłowe")
+    if password_matches(data.new_password, user.password_hash):
+        raise HTTPException(400, "Nowe hasło musi różnić się od obecnego")
+    user.password_hash = password_hash(data.new_password)
+    user.must_change_password = False
+    user.token_version += 1
+    db.commit()
+    return {"message": "Hasło zmienione. Zaloguj się ponownie."}
+
+
+@app.get("/api/users", response_model=list[UserOutput])
+def users(_: User = Depends(admin_user), db: Session = Depends(db_session)):
+    return db.scalars(select(User).order_by(User.email)).all()
+
+
+@app.post("/api/users", response_model=UserOutput, status_code=201)
+def add_user(data: UserInput, _: User = Depends(admin_user), db: Session = Depends(db_session)):
+    temporary_password = secrets.token_urlsafe(18)
+    record = User(email=data.email, role=data.role, password_hash=password_hash(temporary_password), must_change_password=True)
+    db.add(record)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Użytkownik z tym adresem e-mail już istnieje")
+    try:
+        account_mail.send_welcome(record.email, temporary_password, mail_config(db))
+    except Exception:
+        db.rollback()
+        raise HTTPException(502, "Nie udało się wysłać wiadomości. Konto nie zostało zapisane. Sprawdź konfigurację SMTP.")
+    db.commit()
+    return record
+
+
+def managed_user(db, user_id, actor):
+    # Lock accounts in a stable order to protect the last active administrator.
+    records = db.scalars(select(User).order_by(User.id).with_for_update().execution_options(populate_existing=True)).all()
+    if actor.role != "admin" or actor.blocked:
+        raise HTTPException(403, "Brak uprawnień administratora")
+    record = next((item for item in records if item.id == user_id), None)
+    if not record:
+        raise HTTPException(404, "Nie znaleziono użytkownika")
+    if record.id == actor.id:
+        raise HTTPException(400, "Nie możesz zmieniać uprawnień, blokować ani usuwać własnego konta")
+    if record.role == "admin" and not record.blocked and sum(item.role == "admin" and not item.blocked for item in records) <= 1:
+        raise HTTPException(400, "Musi pozostać co najmniej jeden aktywny administrator")
+    return record
+
+
+@app.put("/api/users/{user_id}", response_model=UserOutput)
+def update_user(user_id: UUID, data: UserUpdate, actor: User = Depends(admin_user), db: Session = Depends(db_session)):
+    record = managed_user(db, user_id, actor)
+    if record.role != data.role or record.blocked != data.blocked:
+        record.token_version += 1
+    record.role = data.role
+    record.blocked = data.blocked
+    db.commit()
+    return record
+
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: UUID, actor: User = Depends(admin_user), db: Session = Depends(db_session)):
+    db.delete(managed_user(db, user_id, actor))
+    db.commit()
+    return {"deleted": True}
+
+
+class MailSettingsInput(BaseModel):
+    host: str = Field(min_length=1, max_length=255, pattern=r"^[a-zA-Z0-9.-]+$")
+    port: int = Field(ge=1, le=65535)
+    security: Literal["starttls", "ssl"] = "starttls"
+    username: str = Field(default="", max_length=255)
+    password: str | None = Field(default=None, max_length=2048)
+    sender: str = Field(max_length=255)
+    public_url: str = Field(default="", max_length=2048)
+
+    @field_validator("sender")
+    @classmethod
+    def valid_sender(cls, value):
+        return UserInput.valid_email(value)
+
+    @field_validator("public_url")
+    @classmethod
+    def valid_url(cls, value):
+        value = value.strip().rstrip("/")
+        if value and (not value.startswith("https://") or any(char.isspace() for char in value)):
+            raise ValueError("Podaj adres HTTPS panelu")
+        return value
+
+
+def mail_config(db):
+    settings = db.get(MailSettings, 1)
+    if not settings:
+        return None
+    return {"SMTP_HOST": settings.host, "SMTP_PORT": settings.port, "SMTP_SECURITY": settings.security,
+            "SMTP_USERNAME": settings.username, "SMTP_PASSWORD": fernet.decrypt(settings.password_encrypted.encode()).decode() if settings.password_encrypted else "",
+            "SMTP_FROM": settings.sender, "PUBLIC_APP_URL": settings.public_url}
+
+
+@app.get("/api/settings/mail")
+def get_mail_settings(_: User = Depends(admin_user), db: Session = Depends(db_session)):
+    settings = db.get(MailSettings, 1)
+    if not settings:
+        return {"host": os.getenv("SMTP_HOST", ""), "port": int(os.getenv("SMTP_PORT", "587")),
+                "security": os.getenv("SMTP_SECURITY", "starttls"), "username": os.getenv("SMTP_USERNAME", ""),
+                "sender": os.getenv("SMTP_FROM", ""), "public_url": os.getenv("PUBLIC_APP_URL", ""),
+                "password_set": bool(os.getenv("SMTP_PASSWORD"))}
+    return {**{key: getattr(settings, key) for key in ("host", "port", "security", "username", "sender", "public_url")},
+            "password_set": bool(settings.password_encrypted)}
+
+
+@app.put("/api/settings/mail")
+def save_mail_settings(data: MailSettingsInput, _: User = Depends(admin_user), db: Session = Depends(db_session)):
+    settings = db.get(MailSettings, 1)
+    if not settings:
+        settings = MailSettings(id=1)
+        initial_password = os.getenv("SMTP_PASSWORD", "")
+        settings.password_encrypted = fernet.encrypt(initial_password.encode()).decode() if initial_password else None
+        db.add(settings)
+    for key, value in data.model_dump(exclude={"password"}).items():
+        setattr(settings, key, value)
+    if data.password is not None:
+        settings.password_encrypted = fernet.encrypt(data.password.encode()).decode() if data.password else None
+    db.commit()
+    return {"saved": True}
+
+
+class GoogleCalendarInput(BaseModel):
+    client_id: str = Field(min_length=1, max_length=255, pattern=r"^[a-zA-Z0-9._-]+$")
+    client_secret: str | None = Field(default=None, max_length=2048)
+    public_url: str = Field(max_length=2048)
+    automatic: bool = True
+
+    @field_validator("public_url")
+    @classmethod
+    def valid_origin(cls, value):
+        value = value.strip().rstrip("/")
+        parsed = urlsplit(value)
+        local = parsed.hostname in ("localhost", "127.0.0.1")
+        if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path or any(char.isspace() for char in value):
+            raise ValueError("Podaj adres panelu bez ścieżki i parametrów")
+        if parsed.scheme != "https" and not (local and parsed.scheme == "http"):
+            raise ValueError("Adres panelu musi używać HTTPS (lokalnie można użyć HTTP)")
+        return value
+
+
+google_sync_lock = threading.Lock()
+
+
+@contextmanager
+def locked_google_settings(db):
+    if not google_sync_lock.acquire(blocking=False):
+        raise HTTPException(409, "Trwa operacja Kalendarza Google. Spróbuj za chwilę.")
+    try:
+        settings = db.scalar(select(GoogleCalendarSettings).where(GoogleCalendarSettings.id == 1).with_for_update(skip_locked=True).execution_options(populate_existing=True))
+        if not settings and db.get(GoogleCalendarSettings, 1):
+            raise HTTPException(409, "Trwa operacja Kalendarza Google. Spróbuj za chwilę.")
+        yield settings
+    finally:
+        google_sync_lock.release()
+
+
+@app.get("/api/integrations/google-calendar")
+def google_calendar_settings(_: User = Depends(admin_user), db: Session = Depends(db_session)):
+    settings = db.get(GoogleCalendarSettings, 1)
+    if not settings:
+        return {"client_id": "", "public_url": "", "client_secret_set": False, "connected": False,
+                "automatic": True, "calendar_id": None, "last_synced_at": None, "last_error": None}
+    return {"client_id": settings.client_id, "public_url": settings.public_url,
+            "client_secret_set": bool(settings.client_secret_encrypted), "connected": bool(settings.refresh_token_encrypted and settings.calendar_id),
+            "automatic": settings.automatic, "calendar_id": settings.calendar_id,
+            "last_synced_at": settings.last_synced_at, "last_error": settings.last_error}
+
+
+def clear_google_states(db):
+    for state in db.scalars(select(GoogleCalendarOAuthState)):
+        db.delete(state)
+
+
+@app.put("/api/integrations/google-calendar")
+def save_google_calendar(data: GoogleCalendarInput, _: User = Depends(admin_user), db: Session = Depends(db_session)):
+    with locked_google_settings(db) as settings:
+        if settings and settings.refresh_token_encrypted and data.client_id != settings.client_id:
+            raise HTTPException(400, "Rozłącz konto przed zmianą Client ID")
+        if not settings:
+            if not data.client_secret:
+                raise HTTPException(400, "Podaj Client Secret z Google Cloud")
+            settings = GoogleCalendarSettings(id=1)
+            db.add(settings)
+        settings.client_id = data.client_id
+        settings.public_url = data.public_url
+        settings.automatic = data.automatic
+        if data.client_secret:
+            settings.client_secret_encrypted = fernet.encrypt(data.client_secret.encode()).decode()
+        clear_google_states(db)
+        db.commit()
+    return {"saved": True}
+
+
+@app.post("/api/integrations/google-calendar/connect")
+def connect_google_calendar(response: Response, user: User = Depends(admin_user), db: Session = Depends(db_session)):
+    with locked_google_settings(db) as settings:
+        if not settings:
+            raise HTTPException(400, "Najpierw zapisz konfigurację Google OAuth")
+        clear_google_states(db)
+        state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(48)
+        db.add(GoogleCalendarOAuthState(state_hash=hashlib.sha256(state.encode()).hexdigest(), user_id=user.id,
+            token_version=user.token_version, verifier_encrypted=fernet.encrypt(verifier.encode()).decode(),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)))
+        url = google_calendar.authorization_url(settings.client_id, settings.public_url + google_calendar.CALLBACK_PATH, state, verifier)
+        response.set_cookie("google_calendar_state", state, max_age=600, httponly=True,
+                            secure=settings.public_url.startswith("https://"), samesite="lax", path=google_calendar.CALLBACK_PATH)
+        db.commit()
+    return {"url": url}
+
+
+@app.get(google_calendar.CALLBACK_PATH)
+def google_calendar_callback(request: Request, state: str = "", code: str = "", error: str = "", db: Session = Depends(db_session)):
+    cookie = request.cookies.get("google_calendar_state", "")
+    if not state or not cookie or len(state) > 200 or not secrets.compare_digest(state, cookie):
+        raise HTTPException(400, "Nieprawidłowe potwierdzenie Google. Rozpocznij łączenie ponownie w Ustawieniach.")
+    with locked_google_settings(db) as settings:
+        pending = db.get(GoogleCalendarOAuthState, hashlib.sha256(state.encode()).hexdigest())
+        if not settings or not pending or pending.expires_at.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
+            raise HTTPException(400, "Połączenie Google wygasło lub zostało już wykorzystane")
+        owner = db.get(User, pending.user_id)
+        if not owner or owner.blocked or owner.role != "admin" or owner.must_change_password or owner.token_version != pending.token_version:
+            raise HTTPException(403, "Sesja administratora nie jest już aktywna. Zaloguj się ponownie.")
+        verifier = fernet.decrypt(pending.verifier_encrypted.encode()).decode()
+        db.delete(pending)
+        result = "connected"
+        try:
+            if error or not code:
+                raise google_calendar.GoogleError("Nie udzielono zgody na połączenie Kalendarza Google.")
+            credentials = google_calendar.exchange_code(settings.client_id,
+                fernet.decrypt(settings.client_secret_encrypted.encode()).decode(),
+                settings.public_url + google_calendar.CALLBACK_PATH, code, verifier)
+            calendar_id = settings.calendar_id
+            if calendar_id:
+                try:
+                    google_calendar.request("GET", google_calendar.API + "/calendars/" + quote(calendar_id, safe=""), token=credentials["access_token"])
+                except google_calendar.GoogleError as cause:
+                    if cause.status not in (403, 404, 410):
+                        raise
+                    calendar_id = None
+            if not calendar_id:
+                calendar_id = google_calendar.create_calendar(credentials["access_token"])
+            settings.calendar_id = calendar_id
+            settings.refresh_token_encrypted = fernet.encrypt(credentials["refresh_token"].encode()).decode()
+            settings.last_error = None
+        except google_calendar.GoogleError as cause:
+            settings.last_error = str(cause)
+            result = "error"
+        redirect = RedirectResponse(settings.public_url + "/?google_calendar=" + result, status_code=303)
+        redirect.delete_cookie("google_calendar_state", path=google_calendar.CALLBACK_PATH)
+        redirect.headers["Cache-Control"] = "no-store"
+        redirect.headers["Referrer-Policy"] = "no-referrer"
+        db.commit()
+    return redirect
+
+
+@app.delete("/api/integrations/google-calendar/connection")
+def disconnect_google_calendar(_: User = Depends(admin_user), db: Session = Depends(db_session)):
+    with locked_google_settings(db) as settings:
+        warning = None
+        if settings:
+            if settings.refresh_token_encrypted:
+                try:
+                    google_calendar.request("POST", "https://oauth2.googleapis.com/revoke",
+                        {"token": fernet.decrypt(settings.refresh_token_encrypted.encode()).decode()}, form=True)
+                except google_calendar.GoogleError:
+                    warning = "Synchronizacja wyłączona. Cofnięcie zgody w Google nie zostało potwierdzone; możesz usunąć dostęp w ustawieniach konta Google."
+            settings.refresh_token_encrypted = None
+            settings.calendar_id = None
+            settings.automatic = False
+            settings.last_synced_at = None
+            settings.last_error = None
+        clear_google_states(db)
+        db.commit()
+    return {"disconnected": True, "warning": warning}
+
+
+def run_google_sync(db, automatic=False):
+    with locked_google_settings(db) as settings:
+        if not settings or not settings.refresh_token_encrypted or not settings.calendar_id:
+            if automatic:
+                return {"skipped": True}
+            raise HTTPException(400, "Najpierw połącz Kalendarz Google")
+        if automatic and (not settings.automatic or (settings.last_synced_at and settings.last_synced_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc) - timedelta(minutes=5))):
+            return {"skipped": True}
+        try:
+            token = google_calendar.refresh_access(settings.client_id, fernet.decrypt(settings.client_secret_encrypted.encode()).decode(),
+                fernet.decrypt(settings.refresh_token_encrypted.encode()).decode())
+            events = get_deadlines(db, audience="operator")
+            clients = {client.id: client.name for client in db.scalars(select(Company))}
+            result = google_calendar.sync_events(token, settings.calendar_id, settings.namespace, events, clients)
+            settings.last_synced_at = datetime.now(timezone.utc)
+            settings.last_error = None
+        except google_calendar.GoogleError as cause:
+            settings.last_error = str(cause)
+            db.commit()
+            raise HTTPException(502, str(cause)) from None
+        db.commit()
+    return result
+
+
+@app.post("/api/integrations/google-calendar/sync")
+def sync_google_calendar(_: User = Depends(admin_user), db: Session = Depends(db_session)):
+    return run_google_sync(db)
+
+
+def google_sync_tick():
+    with SessionLocal() as db:
+        try:
+            run_google_sync(db, automatic=True)
+        except HTTPException:
+            pass  # Provider errors are recorded in the settings panel; another worker may hold the lock.
+
+
+async def google_calendar_loop(stop):
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=300)
+        except asyncio.TimeoutError:
+            try:
+                await asyncio.to_thread(google_sync_tick)
+            except Exception:
+                logging.getLogger(__name__).error("Google Calendar background sync failed")
 
 
 @app.get("/api/companies", response_model=list[CompanyOutput])
@@ -682,13 +1131,42 @@ def update_company(company_id: UUID, data: CompanyInput, _: User = Depends(curre
     return company
 
 
+@app.delete("/api/companies/{company_id}")
+def delete_company(company_id: UUID, _: User = Depends(admin_user), db: Session = Depends(db_session)):
+    company = db.scalar(select(Company).where(Company.id == company_id).with_for_update())
+    if not company:
+        raise HTTPException(404, "Nie znaleziono klienta")
+    document_ids = select(Document.id).where(Document.company_id == company_id)
+    service_ids = select(ClientService.id).where(ClientService.company_id == company_id)
+    objects = list(db.execute(select(DocumentFile.s3_bucket, DocumentFile.s3_key).where(
+        DocumentFile.document_id.in_(document_ids), DocumentFile.s3_key.is_not(None))))
+    # Delete dependencies in one transaction before removing the client.
+    db.execute(delete(ServicePublicLink).where((ServicePublicLink.company_id == company_id) | ServicePublicLink.service_id.in_(service_ids)))
+    db.execute(delete(WhatsAppSubscription).where(WhatsAppSubscription.company_id == company_id))
+    db.execute(delete(WhatsAppDelivery).where(WhatsAppDelivery.company_id == company_id))
+    db.execute(delete(DocumentFile).where(DocumentFile.document_id.in_(document_ids)))
+    db.execute(delete(Deadline).where((Deadline.company_id == company_id) | Deadline.document_id.in_(document_ids)))
+    db.execute(delete(ClientService).where(ClientService.company_id == company_id))
+    db.execute(delete(Document).where(Document.company_id == company_id))
+    db.execute(delete(Company).where(Company.id == company_id))
+    db.commit()
+    cleanup_failed = False
+    for bucket, key in objects:
+        try:
+            s3_client().delete_object(Bucket=bucket, Key=key)
+        except Exception:
+            cleanup_failed = True
+            logging.getLogger(__name__).error("S3 cleanup failed for deleted client %s, bucket %s, key %s", company_id, bucket, key)
+    return {"deleted": True, "cleanup_warning": "Klienta usunięto, ale nie udało się usunąć wszystkich plików z S3. Sprawdź logi serwera." if cleanup_failed else None}
+
+
 @app.get("/api/deadline-types", response_model=list[DeadlineTypeOutput])
 def deadline_types(_: User = Depends(current_user), db: Session = Depends(db_session)):
     return db.scalars(select(DeadlineType).order_by(DeadlineType.name)).all()
 
 
 @app.post("/api/deadline-types", response_model=DeadlineTypeOutput)
-def add_deadline_type(data: DeadlineTypeInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def add_deadline_type(data: DeadlineTypeInput, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     record = DeadlineType(**data.model_dump(), name_key=deadline_type_key(data.name))
     db.add(record)
     return save_deadline_type(db, record)
@@ -705,7 +1183,7 @@ def save_deadline_type(db, record):
 
 
 @app.put("/api/deadline-types/{type_id}", response_model=DeadlineTypeOutput)
-def update_deadline_type(type_id: UUID, data: DeadlineTypeInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def update_deadline_type(type_id: UUID, data: DeadlineTypeInput, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     record = db.get(DeadlineType, type_id)
     if not record:
         raise HTTPException(404, "Nie znaleziono rodzaju terminu")
@@ -733,7 +1211,7 @@ def document_types(_: User = Depends(current_user), db: Session = Depends(db_ses
 
 
 @app.post("/api/document-types", response_model=DocumentTypeOutput)
-def add_document_type(data: DocumentTypeInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def add_document_type(data: DocumentTypeInput, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     name = " ".join(data.name.split())
     record = db.scalar(select(DocumentType).where(DocumentType.name_key == name.casefold()))
     if record and not record.deleted_at:
@@ -754,7 +1232,7 @@ def add_document_type(data: DocumentTypeInput, _: User = Depends(current_user), 
 
 
 @app.put("/api/document-types/{type_id}", response_model=DocumentTypeOutput)
-def update_document_type(type_id: UUID, data: DocumentTypeInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def update_document_type(type_id: UUID, data: DocumentTypeInput, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     record = db.get(DocumentType, type_id)
     if not record or record.deleted_at:
         raise HTTPException(404, "Nie znaleziono rodzaju dokumentu")
@@ -771,7 +1249,7 @@ def update_document_type(type_id: UUID, data: DocumentTypeInput, _: User = Depen
 
 
 @app.delete("/api/document-types/{type_id}")
-def delete_document_type(type_id: UUID, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def delete_document_type(type_id: UUID, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     record = db.get(DocumentType, type_id)
     if not record or record.deleted_at:
         raise HTTPException(404, "Nie znaleziono rodzaju dokumentu")
@@ -834,6 +1312,30 @@ def update_document(document_id: UUID, data: DocumentInput, _: User = Depends(cu
         db.add(Deadline(title=record.title, due_date=record.due_date, company_id=record.company_id, document_id=record.id, status="planowany"))
     db.commit()
     return {"id": record.id}
+
+
+@app.delete("/api/documents/{document_id}")
+def delete_document(document_id: UUID, _: User = Depends(admin_user), db: Session = Depends(db_session)):
+    record = db.get(Document, document_id)
+    if not record:
+        raise HTTPException(404, "Nie znaleziono dokumentu")
+    attachments = db.scalars(select(DocumentFile).where(DocumentFile.document_id == document_id)).all()
+    objects = [(item.s3_bucket, item.s3_key) for item in attachments if item.s3_key]
+    for attachment in attachments:
+        db.delete(attachment)
+    for event in db.scalars(select(Deadline).where(Deadline.document_id == document_id)):
+        db.delete(event)
+    db.flush()
+    db.delete(record)
+    db.commit()
+    cleanup_failed = False
+    for bucket, key in objects:
+        try:
+            s3_client().delete_object(Bucket=bucket, Key=key)
+        except Exception:
+            cleanup_failed = True
+            logging.getLogger(__name__).error("S3 cleanup failed for deleted document %s, bucket %s, key %s", document_id, bucket, key)
+    return {"deleted": True, "cleanup_warning": "Dokument usunięto, ale nie udało się usunąć wszystkich plików z S3. Sprawdź logi serwera." if cleanup_failed else None}
 
 
 @app.post("/api/documents/{document_id}/files", response_model=list[DocumentFileOutput])
@@ -905,7 +1407,7 @@ def services(_: User = Depends(current_user), db: Session = Depends(db_session))
 
 @app.post("/api/services", response_model=ServiceTemplateOutput)
 @app.post("/api/service-types", response_model=ServiceTemplateOutput)
-def add_service(data: ServiceTemplateInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def add_service(data: ServiceTemplateInput, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     register_deadline_types(db, data.deadline_types)
     service = Service(**data.model_dump(exclude={"deadline_details"}), deadline_details=[item.model_dump(mode="json") for item in data.deadline_details])
     db.add(service)
@@ -916,7 +1418,7 @@ def add_service(data: ServiceTemplateInput, _: User = Depends(current_user), db:
 
 @app.put("/api/services/{service_id}", response_model=ServiceTemplateOutput)
 @app.put("/api/service-types/{service_id}", response_model=ServiceTemplateOutput)
-def update_service(service_id: UUID, data: ServiceTemplateInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def update_service(service_id: UUID, data: ServiceTemplateInput, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     service = db.get(Service, service_id)
     if not service or service.deleted_at:
         raise HTTPException(404, "Nie znaleziono usługi")
@@ -931,7 +1433,7 @@ def update_service(service_id: UUID, data: ServiceTemplateInput, _: User = Depen
 
 @app.delete("/api/services/{service_id}")
 @app.delete("/api/service-types/{service_id}")
-def delete_service(service_id: UUID, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def delete_service(service_id: UUID, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     service = db.get(Service, service_id)
     if not service or service.deleted_at:
         raise HTTPException(404, "Nie znaleziono rodzaju usługi")
@@ -1161,7 +1663,7 @@ async def whatsapp_loop(stop):
 
 @app.get("/api/notifications/settings")
 @app.get("/api/whatsapp/settings")
-def whatsapp_settings(_: User = Depends(current_user), db: Session = Depends(db_session)):
+def whatsapp_settings(_: User = Depends(admin_user), db: Session = Depends(db_session)):
     preferences = notification_preferences(db)
     return {**whatsapp.configuration(), **preferences,
             "providers": {"whatsapp": whatsapp.configuration(), "smsapi": smsapi.configuration()},
@@ -1176,7 +1678,7 @@ class NotificationSettingsInput(BaseModel):
 
 
 @app.put("/api/notifications/settings")
-def save_notification_settings(data: NotificationSettingsInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def save_notification_settings(data: NotificationSettingsInput, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     settings = db.get(NotificationSettings, 1)
     if not settings:
         settings = NotificationSettings(id=1)
@@ -1189,7 +1691,7 @@ def save_notification_settings(data: NotificationSettingsInput, _: User = Depend
 
 @app.put("/api/notifications/subscriptions/{company_id}")
 @app.put("/api/whatsapp/subscriptions/{company_id}")
-def whatsapp_subscribe(company_id: UUID, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def whatsapp_subscribe(company_id: UUID, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     company = db.get(Company, company_id)
     if not company:
         raise HTTPException(404, "Nie znaleziono klienta")
@@ -1208,7 +1710,7 @@ def whatsapp_subscribe(company_id: UUID, _: User = Depends(current_user), db: Se
 
 @app.delete("/api/notifications/subscriptions/{company_id}")
 @app.delete("/api/whatsapp/subscriptions/{company_id}")
-def whatsapp_unsubscribe(company_id: UUID, _: User = Depends(current_user), db: Session = Depends(db_session)):
+def whatsapp_unsubscribe(company_id: UUID, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     item = db.get(WhatsAppSubscription, company_id)
     if item:
         db.delete(item)

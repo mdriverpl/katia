@@ -41,6 +41,24 @@ class StorageTests(unittest.TestCase):
         files = [UploadFile(filename=f"test-{index}.txt", file=BytesIO(content)) for index, content in enumerate(contents)]
         return api.upload_files(self.document.id, files, None, self.db)
 
+    def test_delete_document_removes_s3_and_database_files(self):
+        self.upload(b"delete me")
+        document_id = self.document.id
+        result = api.delete_document(document_id, None, self.db)
+        self.assertTrue(result["deleted"])
+        self.assertIsNone(result["cleanup_warning"])
+        self.client.delete_object.assert_called_once()
+        self.assertIsNone(self.db.get(api.Document, document_id))
+        self.assertEqual(list(self.db.scalars(select(api.DocumentFile))), [])
+
+    def test_delete_reports_s3_cleanup_failure(self):
+        self.upload(b"delete me")
+        self.client.delete_object.side_effect = RuntimeError("offline")
+        with self.assertLogs(api.__name__, level="ERROR"):
+            result = api.delete_document(self.document.id, None, self.db)
+        self.assertTrue(result["deleted"])
+        self.assertTrue(result["cleanup_warning"])
+
     def test_s3_round_trip_and_legacy_database_file(self):
         attachment = self.upload(b"hello")[0]
         self.assertEqual(attachment.content, b"")
