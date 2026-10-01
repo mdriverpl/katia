@@ -25,6 +25,9 @@
 
 
   const token = ref(localStorage.getItem('tms_token') || '')
+  const buildVersion = __BUILD_VERSION__
+  const appVersion = __APP_VERSION__
+  const buildDate = new Intl.DateTimeFormat('pl-PL', { dateStyle: 'short', timeStyle: 'short', timeZone: 'Europe/Warsaw' }).format(new Date(__BUILD_DATE__))
   const currentUser = ref(null)
   const isAdmin = computed(() => currentUser.value?.role === 'admin' && !currentUser.value?.must_change_password)
   const passwordRequired = computed(() => !!currentUser.value?.must_change_password)
@@ -302,7 +305,7 @@
         <span class="story-footer">Space &amp; Flow / CENTRUM OPERACYJNE</span>
       </section>
       <section class="login-card"><ThemeSwitcher /><p class="eyebrow">TWOJA PRZESTRZEŃ DO PRACY</p><h2>Dobrze Cię widzieć.</h2><p>Zaloguj się i uporządkuj swój dzień.</p>
-        <form @submit.prevent="login"><label>E-mail<input v-model="email" type="email" autocomplete="username" required /></label><label>Hasło<input v-model="password" type="password" autocomplete="current-password" required /></label><button>Zaloguj się <ArrowUpRight :size="18" /></button></form><small v-if="error" class="error" role="alert">{{ error }}</small><div class="login-note"><ShieldCheck :size="17" /><span>Twoje centrum codziennych spraw.</span></div>
+        <form @submit.prevent="login"><label>E-mail<input v-model="email" type="email" autocomplete="username" required /></label><label>Hasło<input v-model="password" type="password" autocomplete="current-password" required /></label><button>Zaloguj się <ArrowUpRight :size="18" /></button></form><small class="login-build">Wersja {{ appVersion }} · Build: {{ buildVersion }}<br />Zbudowano: {{ buildDate }} (czas polski)</small><small v-if="error" class="error" role="alert">{{ error }}</small><div class="login-note"><ShieldCheck :size="17" /><span>Twoje centrum codziennych spraw.</span></div>
       </section>
     </main>
     <main v-else class="app-shell"><div v-if="notice" class="save-notice" role="status">{{ notice }}<button type="button" aria-label="Zamknij powiadomienie" @click="notice = ''"><X :size="16" /></button></div>

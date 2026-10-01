@@ -44,6 +44,7 @@ input:focus, select:focus { border-color: #4d7861; box-shadow: 0 0 0 3px #4d7861
 .primary, .login-card form > button { display: inline-flex; align-items: center; justify-content: center; gap: 10px; min-height: 44px; padding: 11px 19px; border-radius: 9px; background: var(--forest); color: white; font-size: 13px; font-weight: 600; }
 .primary:hover, .login-card form > button:hover { background: #285746; box-shadow: 0 4px 12px #173e3518; }
 .login-card form > button { margin-top: 6px; min-height: 48px; justify-content: space-between; }
+.login-build { display: block; margin-top: 12px; text-align: center; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .login-note { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 30px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
 .app-shell { display: grid; grid-template-columns: 238px minmax(0, 1fr); min-height: 100svh; }
 aside { position: sticky; top: 0; height: 100svh; display: flex; flex-direction: column; background: var(--forest); color: #fffdf4; padding: 36px 18px 24px; }

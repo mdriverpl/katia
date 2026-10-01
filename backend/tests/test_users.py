@@ -125,5 +125,8 @@ class UserTests(unittest.TestCase):
         smtp.login.assert_called_once_with("sender", "smtp-secret")
         message = smtp.send_message.call_args.args[0]
         self.assertEqual(message["To"], "user@example.com")
-        self.assertIn("temporary-pass", message.get_content())
-        self.assertIn("https://panel.example.com", message.get_content())
+        self.assertIn("temporary-pass", message.get_body(preferencelist=("plain",)).get_content())
+        self.assertIn("https://panel.example.com", message.get_body(preferencelist=("plain",)).get_content())
+        html = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn('href="https://panel.example.com"', html)
+        self.assertIn("Zaloguj się do panelu", html)
