@@ -1,5 +1,25 @@
 # TMS
 
+## Dokumenty aplikacji
+
+Polityka prywatności (`/#/privacy`) i warunki korzystania (`/#/terms`) są dostępne
+bez logowania. Linki znajdują się na ekranie logowania, w panelu i w publicznym
+terminarzu. Strony pozwalają wydrukować dokument lub zapisać go jako PDF.
+
+Treść i metryka znajdują się w `frontend/src/legal.js`. Dokumenty mają status
+**projektu**: przed uznaniem ich za obowiązujące trzeba ustalić tożsamość i adres
+operatora, warunki udostępniania innym firmom i powierzenia, właściwe podstawy
+przetwarzania, okresy retencji, dostawców i zasady transferów poza EOG oraz
+potwierdzić kontakt do spraw prywatności. Nie zastępują oceny prawnej i umów
+powierzenia. Oznaczenie `draft` pozostaje włączone do zakończenia tych ustaleń;
+projekt jest oznaczony także na wydruku i wyłączony z indeksowania przez metatag.
+
+Dokumenty uwzględniają model B2B: firma korzystająca z aplikacji co do zasady
+administruje danymi swoich klientów, a operator przetwarza je na jej polecenie.
+Obecne role użytkowników nie zapewniają izolacji między firmami. Niezależne
+firmy wymagają odrębnych wdrożeń i magazynów danych albo wcześniejszego dodania
+i zweryfikowania izolacji organizacji w API, bazie, plikach i integracjach.
+
 ## Formularz klienta
 
 Formularz wymaga imienia i nazwiska. Nazwa klienta jest składana automatycznie

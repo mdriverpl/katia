@@ -1,4 +1,5 @@
 <script setup>
+import LegalLinks from './LegalLinks.vue'
 import StatusBadge from './StatusBadge.vue'
 import { onMounted, ref } from 'vue'
 import BrandLogo from './BrandLogo.vue'
@@ -46,5 +47,6 @@ onMounted(() => {
         <p v-else class="empty">Brak zapisanych terminów.</p>
       </section>
     </template>
+    <LegalLinks />
   </main>
 </template>
