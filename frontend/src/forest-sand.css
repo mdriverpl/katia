@@ -100,6 +100,10 @@ nav button.selected svg { color: var(--gold); }
 .icon-button { display: grid; place-items: center; flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px; background: #eeefe7; color: #41584b; }
 .icon-button:hover { background: #e2e6da; }
 .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.mail-settings-form .mail-field-row { grid-column: 1 / -1; }
+.mail-settings-form .mail-checkbox-row { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.mail-settings-form input[type="checkbox"] { appearance: auto; flex: 0 0 16px; width: 16px; height: 16px; min-height: 16px; margin: 0; padding: 0; accent-color: var(--forest); cursor: pointer; }
+.mail-settings-form input[type="checkbox"]:focus-visible { outline: 2px solid var(--forest); outline-offset: 3px; }
 .modal .primary { justify-self: start; margin-top: 6px; }
 .error { display: block; margin: 14px 0; padding: 12px 15px; border: 1px solid #ebccc4; border-radius: 9px; color: #9b3c30; background: #fff2ed; font-size: 13px; line-height: 1.5; }
 @media (min-width: 1600px) { .login-shell { padding: 32px; } .login-story { padding: 60px 80px; } }

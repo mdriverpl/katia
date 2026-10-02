@@ -33,7 +33,7 @@ export const legalDocuments = {
           'Konta użytkowników: adres e-mail, rola Admin lub Pracownik, skrót hasła, stan blokady konta i informacje potrzebne do obsługi sesji. Nowe konto otrzymuje hasło tymczasowe e-mailem.',
           'Klienci: imię i nazwisko, dane kontaktowe, adres zamieszkania, kraj, język i preferowany sposób kontaktu. Jeżeli zostaną wprowadzone: data urodzenia, PESEL, numer paszportu, NIP, REGON oraz dane kontaktowe pracodawcy.',
           'Obsługa spraw: dokumenty i załączone pliki, numery i statusy dokumentów, rodzaje usług, ceny i koszty, postęp obsługi, terminy, godziny, miejsca oraz wpisane opisy i notatki.',
-          'Komunikacja: adresy nadawców, tematy i podglądy wiadomości zaimportowanych ze skrzynki pocztowej, dane potrzebne do wysyłania powiadomień oraz ich statusy i historia.',
+          'Komunikacja: adresy nadawców, tematy, treści i załączniki wiadomości zaimportowanych ze skrzynki pocztowej do wspólnego bufora, dane potrzebne do wysyłania powiadomień oraz ich statusy i historia.',
           'Dane techniczne: tokeny sesji, ustawienia przeglądarki opisane poniżej, a w zakresie konfiguracji serwera także adres IP, czas żądania i informacje o błędach. Zakres logowania po stronie infrastruktury wymaga potwierdzenia przez operatora.',
           'Dane są wprowadzane przez upoważnionych użytkowników, przekazywane przez klientów lub ich przedstawicieli, a po uruchomieniu funkcji pocztowej mogą pochodzić z podłączonej skrzynki. Przy pozyskaniu danych od innej osoby należy przekazać informację o właściwym źródle danych zgodnie z art. 14 RODO.',
         ],
@@ -102,6 +102,7 @@ export const legalDocuments = {
         },
         paragraphsAfter: [
           'Usunięcie klienta w aplikacji usuwa jego powiązane dane w bazie i uruchamia usuwanie plików w S3. Awaria usuwania plików wymaga dokończenia operacji przez administratora technicznego. Kopie zapasowe i dane u dostawców zewnętrznych nie są automatycznie usuwane przez tę operację.',
+          'Usunięcie klienta lub dokumentu nie usuwa źródłowych wiadomości i załączników z bufora pocztowego ani ze skrzynki e-mail. Bufor nie ma automatycznego usuwania wiadomości; ich usunięcie wymaga obsługi przez administratora technicznego.',
         ],
       },
       {

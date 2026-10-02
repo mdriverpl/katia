@@ -91,12 +91,58 @@ dokumentów są dostępne tylko administratorowi, również przez API.
 Listy rodzajów dokumentów, terminów i usług pozostają dostępne do odczytu
 pracownikom, ponieważ są potrzebne do formularzy.
 
-Przed dodaniem kont skonfiguruj **Ustawienia → Poczta SMTP**: host, port,
+Przed dodaniem kont skonfiguruj **Ustawienia → Poczta → SMTP**: host, port,
 STARTTLS (zwykle 587) lub TLS (zwykle 465), login, hasło, nadawcę oraz adres
 HTTPS panelu. Hasło SMTP jest szyfrowane kluczem wynikającym z `APP_SECRET`;
 zachowaj ten sekret przy ponownym wdrożeniu. Formularz nie ujawnia zapisanego
 hasła; puste pole zachowuje dotychczasową wartość. Błąd SMTP wycofuje dodanie
 konta. Przyjęcie wiadomości przez SMTP nie gwarantuje dostarczenia do skrzynki.
+
+### Bufor poczty i dokumentów
+
+Administrator konfiguruje **Ustawienia → Poczta → IMAP**: dla home.pl serwer
+`speed.home.pl`, port SSL/TLS `993`, login skrzynki. Można użyć zapisanego hasła
+SMTP albo podać osobne hasło IMAP. Dane dostępowe nie są zwracane przez API.
+Bufor jest wspólny dla uprawnionych użytkowników tej instancji aplikacji.
+
+SMTP i IMAP są na wspólnej stronie **Ustawienia → Poczta**, z osobnym zapisem
+każdej sekcji. **Adres skrzynki / login IMAP** wskazuje konto do logowania,
+a **Odbieraj wiadomości tylko od** ogranicza kolejny odbiór do dokładnego adresu
+nadawcy (puste = wszyscy). Ten filtr nie usuwa wcześniej odebranych wiadomości.
+**Prefiks nazw załączników** pozwala dodawać do dokumentów wyłącznie pliki,
+których nazwy zaczynają się od podanego tekstu, bez rozróżniania wielkości liter
+(np. `FV_` pasuje do `fv_123.pdf`). Puste pole dopuszcza wszystkie nazwy.
+Prefiks nie zmienia nazwy pliku; pozostałe załączniki można nadal pobrać.
+
+Aby pominąć archiwum skrzynki, zapisz ustawienia IMAP i kliknij
+**Odbieraj tylko od teraz**. Aplikacja zapisze granicę UID na podstawie
+UIDNEXT z serwera, bez pobierania wiadomości. Kolejne odbiory uwzględniają
+tylko wiadomości przychodzące po tej granicy, nadal stosując filtr nadawcy.
+Wcześniejsze wpisy w Buforze pozostają bez zmian. Ponowne użycie przycisku
+przesuwa granicę na aktualny stan skrzynki. Zmiana konta lub UIDVALIDITY
+wymaga ponownego ustawienia granicy, aby nie pobrać przypadkiem archiwum.
+Operacja jest dostępna tylko administratorom; nie zmienia wiadomości na serwerze.
+
+W **Bufor → Odbierz pocztę** pobierane są wiadomości z INBOX, od najnowszych,
+partiami do 50 wiadomości / 50 MB. Kolejne kliknięcia pobierają także starsze
+wiadomości. Limit pojedynczej wiadomości wraz z załącznikami to 20 MB; większe
+są pomijane i zgłaszane w podsumowaniu. IMAP działa tylko do odczytu, używa
+UID i UIDVALIDITY oraz weryfikuje certyfikat TLS. Nie zmienia flag przeczytania.
+
+Lista wiadomości jest po lewej, podgląd treści i załączników po prawej.
+HTML wiadomości jest zamieniany na tekst, bez uruchamiania skryptów i pobierania
+zdalnych obrazków. Wybierz załączniki (do 10), firmę / klienta z istniejącej listy,
+rodzaj dokumentu i numer, a następnie **Dodaj dokument**. Dokument i pliki
+powstają w jednej transakcji; nie można ponownie dodać tego samego załącznika.
+Pliki trafiają do skonfigurowanego magazynu dokumentów (S3 lub baza).
+
+Pełne wiadomości z załącznikami są przechowywane w bazie w postaci zaszyfrowanej
+kluczem wyprowadzonym z `APP_SECRET`; zachowaj ten sekret przy wdrożeniu.
+Metadane i skróty wiadomości nie są szyfrowane na poziomie aplikacji. Usunięcie
+dokumentu lub klienta nie usuwa oryginału wiadomości z bufora ani ze skrzynki.
+Bufor nie ma automatycznej retencji. Starsze wpisy z poprzedniego importera
+zawierają wyłącznie skróty; ponowny odbiór zapisze pełne wiadomości jako nowe
+wpisy. Tabele bufora tworzą się przy uruchomieniu backendu.
 
 Nowy użytkownik otrzymuje e-mailem losowe hasło tymczasowe i musi zmienić je
 przy pierwszym logowaniu. Każdy użytkownik może zmienić hasło w **Moje konto**,

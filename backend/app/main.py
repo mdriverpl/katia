@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import asyncio
 import hashlib
-import imaplib
 import logging
 import os
 import re
@@ -12,7 +11,6 @@ import threading
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from email import message_from_bytes
 from uuid import UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 from urllib.parse import quote, urlsplit
@@ -26,7 +24,7 @@ from fastapi.responses import Response, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import Date, DateTime, ForeignKey, String, Text, LargeBinary, Numeric, JSON, create_engine, select, delete, text, inspect
+from sqlalchemy import Date, DateTime, ForeignKey, String, Text, LargeBinary, BigInteger, Numeric, JSON, create_engine, select, delete, text, inspect
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy.exc import IntegrityError
 from botocore.exceptions import BotoCoreError, ClientError
@@ -385,6 +383,45 @@ class EmailMessage(Base):
     preview: Mapped[str] = mapped_column(Text)
 
 
+class InboxSettings(Base):
+    __tablename__ = "inbox_settings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    host: Mapped[str] = mapped_column(String(255))
+    port: Mapped[int]
+    username: Mapped[str] = mapped_column(String(255))
+    use_smtp_password: Mapped[bool] = mapped_column(default=True)
+    password_encrypted: Mapped[str | None] = mapped_column(Text)
+    sender_filter: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    attachment_prefix: Mapped[str] = mapped_column(String(100), default="", server_default="")
+
+
+class InboxContent(Base):
+    __tablename__ = "inbox_content"
+    email_id: Mapped[UUID] = mapped_column(ForeignKey("email_messages.id"), primary_key=True)
+    raw_encrypted: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
+
+
+class InboxBoundary(Base):
+    __tablename__ = "inbox_boundary"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    namespace: Mapped[str] = mapped_column(String(64))
+    last_uid: Mapped[int] = mapped_column(BigInteger)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class InboxImport(Base):
+    __tablename__ = "inbox_imports"
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    email_id: Mapped[UUID] = mapped_column(ForeignKey("email_messages.id"), index=True)
+    # Keep the receipt after document deletion to prevent accidental duplicate import.
+    document_id: Mapped[UUID]
+
+
+class InboxSkipped(Base):
+    __tablename__ = "inbox_skipped"
+    message_id: Mapped[str] = mapped_column(String(500), primary_key=True)
+
+
 class LoginInput(BaseModel):
     email: str
     password: str
@@ -476,12 +513,6 @@ class DeadlineInput(BaseModel):
     deadline_types: list[str] = Field(default_factory=list, max_length=30)
 
 
-class ImapInput(BaseModel):
-    host: str
-    username: str
-    password: str
-
-
 def password_hash(password: str) -> str:
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 600000)
@@ -526,6 +557,10 @@ def admin_user(user: User = Depends(current_user)) -> User:
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
+        inbox_columns = {column["name"] for column in inspect(connection).get_columns("inbox_settings")}
+        for name, length in (("sender_filter", 255), ("attachment_prefix", 100)):
+            if name not in inbox_columns:
+                connection.execute(text(f"ALTER TABLE inbox_settings ADD COLUMN {name} VARCHAR({length}) NOT NULL DEFAULT ''"))
         user_columns = {column["name"] for column in inspect(connection).get_columns("users")}
         for name, definition in {
             "role": "VARCHAR(20) NOT NULL DEFAULT 'employee'",
@@ -834,6 +869,11 @@ class MailSettingsInput(BaseModel):
     password: str | None = Field(default=None, max_length=2048)
     sender: str = Field(max_length=255)
     public_url: str = Field(default="", max_length=2048)
+
+    @field_validator("host", "username", "sender", "public_url", mode="before")
+    @classmethod
+    def trim_addresses(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("sender")
     @classmethod
@@ -1756,25 +1796,6 @@ def emails(_: User = Depends(current_user), db: Session = Depends(db_session)):
     return db.scalars(select(EmailMessage).order_by(EmailMessage.received_at.desc()).limit(50)).all()
 
 
-@app.post("/api/emails/sync")
-def sync_mail(data: ImapInput, _: User = Depends(current_user), db: Session = Depends(db_session)):
-    try:
-        mailbox = imaplib.IMAP4_SSL(data.host)
-        mailbox.login(data.username, data.password)
-        mailbox.select("INBOX", readonly=True)
-        _, ids = mailbox.search(None, "ALL")
-        imported = 0
-        for message_number in ids[0].split()[-25:]:
-            _, raw = mailbox.fetch(message_number, "(RFC822)")
-            message = message_from_bytes(raw[0][1])
-            message_id = message.get("Message-ID", f"imap-{message_number.decode()}")
-            if db.scalar(select(EmailMessage).where(EmailMessage.message_id == message_id)):
-                continue
-            body = message.get_payload(decode=True)
-            db.add(EmailMessage(message_id=message_id, sender=message.get("From", ""), subject=message.get("Subject", ""), received_at=datetime.now(timezone.utc), preview=body.decode(errors="replace")[:1000] if isinstance(body, bytes) else ""))
-            imported += 1
-        db.commit()
-        mailbox.logout()
-        return {"imported": imported}
-    except imaplib.IMAP4.error as error:
-        raise HTTPException(400, f"Błąd IMAP: {error}") from error
+from . import inbox
+import sys
+inbox.register(sys.modules[__name__])

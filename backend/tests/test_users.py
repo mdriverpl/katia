@@ -14,6 +14,18 @@ with patch.dict(os.environ, {"DATABASE_URL": "sqlite://", "APP_SECRET": "isolate
 
 
 class UserTests(unittest.TestCase):
+    def test_smtp_save_trims_addresses_and_preserves_password_spaces(self):
+        data = api.MailSettingsInput(host=' smtp.gmail.com ', port=465, security='ssl', username=' user@gmail.com ',
+                                     password=' test-password ', sender=' USER@gmail.com ', public_url=' https://katia.example.com/ ')
+        api.save_mail_settings(data, self.admin, self.db)
+        saved = api.get_mail_settings(self.admin, self.db)
+        self.assertEqual(saved['host'], 'smtp.gmail.com')
+        self.assertEqual(saved['username'], 'user@gmail.com')
+        self.assertEqual(saved['sender'], 'user@gmail.com')
+        self.assertEqual(saved['public_url'], 'https://katia.example.com')
+        self.assertTrue(saved['password_set'])
+        self.assertEqual(api.mail_config(self.db)['SMTP_PASSWORD'], ' test-password ')
+
     def setUp(self):
         self.engine = create_engine("sqlite://")
         api.Base.metadata.create_all(self.engine)
