@@ -422,6 +422,11 @@ class InboxSkipped(Base):
     message_id: Mapped[str] = mapped_column(String(500), primary_key=True)
 
 
+class InboxCompleted(Base):
+    __tablename__ = "inbox_completed"
+    email_id: Mapped[UUID] = mapped_column(ForeignKey("email_messages.id"), primary_key=True)
+
+
 class LoginInput(BaseModel):
     email: str
     password: str

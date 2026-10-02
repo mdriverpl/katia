@@ -130,10 +130,27 @@ są pomijane i zgłaszane w podsumowaniu. IMAP działa tylko do odczytu, używa
 UID i UIDVALIDITY oraz weryfikuje certyfikat TLS. Nie zmienia flag przeczytania.
 
 Lista wiadomości jest po lewej, podgląd treści i załączników po prawej.
+W karcie klienta, w zakładce **Dokumenty**, przyciski **Dodaj dokument**
+i **Dodaj z bufora** otwierają okna modalne. Dokument jest przypisywany
+automatycznie do otwartego klienta. Wybór z bufora korzysta z tej samej listy
+wiadomości, podglądu załączników i zasad oznaczania obsłużonych plików.
+Lista pokazuje nieobsłużone wiadomości z ostatnich 24 godzin według daty
+wiadomości. Filtr działa przed podziałem na strony i nie usuwa starszych danych.
+Wybranie wiadomości automatycznie otwiera pierwszy obsługiwany załącznik.
+Przyciski z nazwami plików przełączają podgląd PDF, obrazów lub tekstu
+(TXT, CSV, LOG). Inne formaty można pobrać. Treść wiadomości można rozwinąć
+pod podglądem; pliki tekstowe wyświetlane są jako tekst, bez uruchamiania HTML.
 HTML wiadomości jest zamieniany na tekst, bez uruchamiania skryptów i pobierania
-zdalnych obrazków. Wybierz załączniki (do 10), firmę / klienta z istniejącej listy,
-rodzaj dokumentu i numer, a następnie **Dodaj dokument**. Dokument i pliki
+zdalnych obrazków. Kliknij **Dodaj dokument** u góry podglądu wiadomości.
+W oknie modalnym wybierz załączniki (do 10), firmę / klienta z podpowiedzi
+(wyszukiwanie po nazwie, pracodawcy lub e-mailu), rodzaj i numer dokumentu,
+a następnie **Zapisz dokument**. Dokument i pliki
 powstają w jednej transakcji; nie można ponownie dodać tego samego załącznika.
+Po zapisie załączniki znikają z bufora, a po dodaniu wszystkich załączników
+wiadomość znika z listy. Częściowy import pozostawia pozostałe pliki do obsługi.
+Stan obsłużenia zapisywany jest razem z dokumentem; błąd zapisu pozostawia bufor
+bez zmian. Oryginał na serwerze pocztowym nie jest usuwany, a zapisane metadane
+zapobiegają ponownemu pobraniu tej samej wiadomości.
 Pliki trafiają do skonfigurowanego magazynu dokumentów (S3 lub baza).
 
 Pełne wiadomości z załącznikami są przechowywane w bazie w postaci zaszyfrowanej

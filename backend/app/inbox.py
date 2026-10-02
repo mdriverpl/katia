@@ -5,7 +5,7 @@ import os
 import re
 import ssl
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime, getaddresses
@@ -263,6 +263,9 @@ def content_for(api, db, email_id):
 
 
 def import_document(api, db, email_id, data):
+    # Serializes imports of different attachments from the same message.
+    if not db.scalar(select(api.EmailMessage).where(api.EmailMessage.id == email_id).with_for_update()):
+        raise HTTPException(404, "Nie znaleziono wiadomości")
     if not db.get(api.Company, data.company_id):
         raise HTTPException(404, "Nie znaleziono firmy / klienta")
     kind = db.get(api.DocumentType, data.document_type_id)
@@ -281,14 +284,19 @@ def import_document(api, db, email_id, data):
                             title=kind.name, number=data.number, status="nowy")
     uploads = []
     try:
+        imported = set(db.scalars(select(api.InboxImport.id).where(api.InboxImport.email_id == email_id)))
+        imported.update(f"{email_id}:{item['id']}" for item in files)
+        completed = all(f"{email_id}:{item['id']}" in imported for item in parsed["attachments"])
         db.add(document)
         for item in files:
             db.add(api.InboxImport(id=f"{email_id}:{item['id']}", email_id=email_id, document_id=document.id))
+        if completed and not db.get(api.InboxCompleted, email_id):
+            db.add(api.InboxCompleted(email_id=email_id))
         db.flush()  # Unique receipts prevent simultaneous/repeated imports before writing S3.
         uploads = [UploadFile(filename=item["name"], file=BytesIO(item["content"])) for item in files]
         # Commits the document, receipts and files together; cleans up S3 on failure.
         api.upload_files(document.id, uploads, None, db)
-        return {"id": document.id}
+        return {"id": document.id, "buffer_removed": completed}
     except IntegrityError as cause:
         db.rollback()
         raise HTTPException(409, "Wybrany załącznik został już dodany do dokumentu. Odśwież wiadomość.") from cause
@@ -329,14 +337,19 @@ def register(api):
 
     @api.app.get("/api/inbox")
     def messages(offset: int = Query(0, ge=0), _=Depends(api.current_user), db=Depends(api.db_session)):
-        rows = db.scalars(select(api.EmailMessage).order_by(api.EmailMessage.received_at.desc(), api.EmailMessage.id).offset(offset).limit(51)).all()
+        now = datetime.now(timezone.utc)
+        rows = db.scalars(select(api.EmailMessage).where(
+            api.EmailMessage.id.not_in(select(api.InboxCompleted.email_id)),
+            api.EmailMessage.received_at >= now - timedelta(hours=24),
+            api.EmailMessage.received_at <= now,
+        ).order_by(api.EmailMessage.received_at.desc(), api.EmailMessage.id).offset(offset).limit(51)).all()
         return {"items": [{"id": row.id, "sender": row.sender, "subject": row.subject,
                            "received_at": row.received_at, "preview": row.preview[:200]} for row in rows[:50]], "has_more": len(rows) > 50}
 
     @api.app.get("/api/inbox/{email_id}")
     def detail(email_id: UUID, _=Depends(api.current_user), db=Depends(api.db_session)):
         row = db.get(api.EmailMessage, email_id)
-        if not row:
+        if not row or db.get(api.InboxCompleted, email_id):
             raise HTTPException(404, "Nie znaleziono wiadomości")
         if db.get(api.InboxContent, email_id):
             parsed = content_for(api, db, email_id)
@@ -348,10 +361,12 @@ def register(api):
         return {"id": row.id, "sender": row.sender, "subject": row.subject, "received_at": row.received_at,
                 "body": parsed["body"], "attachment_prefix": prefix,
                 "attachments": [{**{key: item[key] for key in ("id", "name", "size")}, "eligible": eligible_attachment(item["name"], prefix),
-                "document_id": receipts.get(f"{email_id}:{item['id']}")} for item in parsed["attachments"]]}
+                "document_id": None} for item in parsed["attachments"] if f"{email_id}:{item['id']}" not in receipts]}
 
     @api.app.get("/api/inbox/{email_id}/attachments/{attachment_id}")
     def download(email_id: UUID, attachment_id: int, _=Depends(api.current_user), db=Depends(api.db_session)):
+        if db.get(api.InboxImport, f"{email_id}:{attachment_id}"):
+            raise HTTPException(404, "Plik przeniesiono do dokumentów")
         parsed = content_for(api, db, email_id)
         item = next((item for item in parsed["attachments"] if item["id"] == attachment_id), None)
         if item is None:

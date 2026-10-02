@@ -5,6 +5,7 @@ import os
 import ssl
 import unittest
 from email.message import EmailMessage
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, AsyncMock, patch
 from uuid import uuid4
 
@@ -36,6 +37,7 @@ class InboxTests(unittest.TestCase):
         self.company = api.Company(kind='osoba', name='Jan Kowalski')
         self.kind = api.DocumentType(name='Wniosek', name_key='wniosek')
         self.mail = api.EmailMessage(id=uuid4(), message_id='test', **{key: inbox.parse_message(example())[key] for key in ('subject', 'sender', 'received_at')}, preview='test')
+        self.mail.received_at = datetime.now(timezone.utc)
         self.db.add_all([self.company, self.kind, self.mail])
         self.db.flush()
         self.db.add(api.InboxContent(email_id=self.mail.id, raw_encrypted=api.fernet.encrypt(example())))
@@ -83,6 +85,55 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(caught.exception.status_code, 409)
             self.assertEqual(len(self.db.scalars(select(api.Document)).all()), 1)
 
+    def test_completed_message_disappears_from_buffer_but_document_remains(self):
+        listing = next(route.endpoint for route in api.app.routes if route.path == '/api/inbox')
+        detail = next(route.endpoint for route in api.app.routes if route.path == '/api/inbox/{email_id}')
+        self.assertEqual(len(listing(0, None, self.db)['items']), 1)
+        with patch.object(api, 'storage_backend', return_value='database'):
+            result = inbox.import_document(api, self.db, self.mail.id, self.data())
+        self.assertTrue(result['buffer_removed'])
+        self.assertEqual(listing(0, None, self.db)['items'], [])
+        with self.assertRaises(HTTPException) as caught:
+            detail(self.mail.id, None, self.db)
+        self.assertEqual(caught.exception.status_code, 404)
+        self.assertIsNotNone(self.db.get(api.Document, result['id']))
+        self.assertIsNotNone(self.db.get(api.EmailMessage, self.mail.id))
+
+    def test_list_filters_last_24_hours_before_pagination(self):
+        now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+        self.mail.received_at = now - timedelta(hours=24)
+        for index in range(55):
+            self.db.add(api.EmailMessage(message_id=f'old-{index}', sender='test@example.com', subject='Old', preview='', received_at=now-timedelta(hours=24, seconds=index+1)))
+        future = api.EmailMessage(message_id='future', sender='test@example.com', subject='Future', preview='', received_at=now+timedelta(seconds=1))
+        self.db.add(future)
+        self.db.commit()
+        listing = next(route.endpoint for route in api.app.routes if route.path == '/api/inbox')
+        with patch.object(inbox, 'datetime') as clock:
+            clock.now.return_value = now
+            result = listing(0, None, self.db)
+            self.assertEqual([item['id'] for item in result['items']], [self.mail.id])
+            self.assertFalse(result['has_more'])
+            clock.now.return_value = now + timedelta(microseconds=1)
+            self.assertEqual(listing(0, None, self.db)['items'], [])
+
+    def test_partial_import_keeps_remaining_attachment_until_it_is_saved(self):
+        from email import policy
+        from email.parser import BytesParser
+        message = BytesParser(policy=policy.default).parsebytes(example())
+        message.add_attachment(b'second file', maintype='application', subtype='pdf', filename='drugi.pdf')
+        raw = message.as_bytes()
+        self.db.get(api.InboxContent, self.mail.id).raw_encrypted = api.fernet.encrypt(raw)
+        self.db.commit()
+        attachments = inbox.parse_message(raw)['attachments']
+        detail = next(route.endpoint for route in api.app.routes if route.path == '/api/inbox/{email_id}')
+        with patch.object(api, 'storage_backend', return_value='database'):
+            first = inbox.import_document(api, self.db, self.mail.id, self.data(attachments=[attachments[0]['id']]))
+            self.assertFalse(first['buffer_removed'])
+            remaining = detail(self.mail.id, None, self.db)['attachments']
+            self.assertEqual([file['name'] for file in remaining], ['drugi.pdf'])
+            second = inbox.import_document(api, self.db, self.mail.id, self.data(attachments=[attachments[1]['id']]))
+            self.assertTrue(second['buffer_removed'])
+
     def test_storage_failure_rolls_back_document_receipt_and_s3(self):
         client = MagicMock()
         client.put_object.side_effect = RuntimeError('storage unavailable')
@@ -92,6 +143,7 @@ class InboxTests(unittest.TestCase):
         client.delete_object.assert_called_once()
         self.assertEqual(self.db.scalars(select(api.Document)).all(), [])
         self.assertEqual(self.db.scalars(select(api.InboxImport)).all(), [])
+        self.assertEqual(self.db.scalars(select(api.InboxCompleted)).all(), [])
 
     def test_invalid_company_type_and_attachment_do_not_create_document(self):
         for data in (self.data(company_id=uuid4()), self.data(document_type_id=uuid4()), self.data(attachments=[999])):

@@ -5,7 +5,7 @@ import FilePreview from './FilePreview.vue'
 import FileTypeTile from './FileTypeTile.vue'
 import DeadlineTypeAutocomplete from './DeadlineTypeAutocomplete.vue'
 import { ArrowLeft, Download, FileText, Pencil, Plus, X } from 'lucide-vue-next'
-const props = defineProps({ documents: Array, clients: Array, types: Array, request: Function, clientFilter: String, canDelete: Boolean })
+const props = defineProps({ documents: Array, clients: Array, types: Array, request: Function, clientFilter: String, canDelete: Boolean, fixedClientId: String })
 const emit = defineEmits(['saved', 'download', 'cancelled'])
 const preview = ref(null)
 const query = ref('')
@@ -74,7 +74,7 @@ async function remove(item) {
   } catch (cause) { error.value = cause.message }
   finally { busy.value = false }
 }
-defineExpose({ open })
+defineExpose({ open, close, busy })
 </script>
 
 <template>
@@ -106,7 +106,7 @@ defineExpose({ open })
     <button type="button" class="text-button" :disabled="busy" @click="close"><ArrowLeft :size="16" />Wróć do listy</button>
     <h2>{{ editing ? 'Edytuj dokument' : 'Dodaj dokument' }}</h2>
     <fieldset class="service-fields" :disabled="busy || !!savedId">
-      <label>Klient<select v-model="form.company_id" required><option value="" disabled>Wybierz klienta</option><option v-for="item in clients" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
+      <label>Klient<select v-model="form.company_id" required :disabled="!!fixedClientId"><option value="" disabled>Wybierz klienta</option><option v-for="item in clients" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
       <label>Rodzaj dokumentu<select v-model="form.document_type_id"><option :value="null">Nie wybrano</option><option v-for="item in types" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
       <label>Nazwa<input v-model="form.title" required maxlength="255" /></label><label>Numer<input v-model="form.number" maxlength="100" /></label>
       <label>Status<select v-model="form.status"><option v-for="status in statuses" :key="status">{{ status }}</option></select></label>
